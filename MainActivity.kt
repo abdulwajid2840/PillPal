@@ -152,15 +152,24 @@ Text: $q"""
         val body = JSONObject()
             .put("contents", JSONArray().put(JSONObject().put("parts", JSONArray().put(JSONObject().put("text", prompt)))))
             .put("generationConfig", JSONObject().put("responseMimeType", "application/json"))
-        val cn = URL("https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent").openConnection() as HttpURLConnection
-        cn.requestMethod = "POST"
-        cn.setRequestProperty("Content-Type", "application/json")
-        cn.setRequestProperty("x-goog-api-key", key)
-        cn.doOutput = true
-        cn.outputStream.use { it.write(body.toString().toByteArray()) }
-        val code = cn.responseCode
-        val txt = (if (code in 200..299) cn.inputStream else cn.errorStream).bufferedReader().readText()
-        if (code !in 200..299) throw Exception(JSONObject(txt).optJSONObject("error")?.optString("message") ?: "HTTP $code")
+        var txt = ""
+        var lastErr = "Unknown error"
+        val models = listOf(model, "gemini-3.5-flash-lite", "gemini-flash-lite-latest", "gemini-flash-latest").distinct()
+        loop@ for (md in models) for (attempt in 1..2) {
+            val cn = URL("https://generativelanguage.googleapis.com/v1beta/models/$md:generateContent").openConnection() as HttpURLConnection
+            cn.requestMethod = "POST"
+            cn.setRequestProperty("Content-Type", "application/json")
+            cn.setRequestProperty("x-goog-api-key", key)
+            cn.doOutput = true
+            cn.outputStream.use { it.write(body.toString().toByteArray()) }
+            val code = cn.responseCode
+            val r = (if (code in 200..299) cn.inputStream else cn.errorStream).bufferedReader().readText()
+            if (code in 200..299) { txt = r; break@loop }
+            lastErr = runCatching { JSONObject(r).getJSONObject("error").getString("message") }.getOrDefault("HTTP $code")
+            if (code !in listOf(404, 429, 500, 503, 504)) throw Exception(lastErr)
+            Thread.sleep(1500)
+        }
+        if (txt.isEmpty()) throw Exception(lastErr)
         val out = JSONObject(txt).getJSONArray("candidates").getJSONObject(0).getJSONObject("content")
             .getJSONArray("parts").getJSONObject(0).getString("text").trim()
             .removePrefix("```json").removePrefix("```").removeSuffix("```").trim()
@@ -322,7 +331,7 @@ class MainActivity : Activity() {
         box.addView(btn("Create with AI") {
             aiText = q.text.toString()
             val key = Core.sp(this).getString("key", "") ?: ""
-            val model = Core.sp(this).getString("model", "gemini-flash-latest") ?: "gemini-flash-latest"
+            val model = Core.sp(this).getString("model", "gemini-3.5-flash-lite") ?: "gemini-3.5-flash-lite"
             if (key.isEmpty()) { aiMsg = "Add your Gemini API key in Settings first."; show() }
             else if (aiText.isNotBlank()) {
                 aiMsg = "Thinking..."; show()
@@ -346,10 +355,10 @@ class MainActivity : Activity() {
         val sp = Core.sp(this)
         box.addView(tv("Gemini API key (from aistudio.google.com)"))
         val key = et("AIza...", sp.getString("key", "") ?: "")
-        val model = et("Model", sp.getString("model", "gemini-flash-latest") ?: "gemini-flash-latest")
+        val model = et("Model", sp.getString("model", "gemini-3.5-flash-lite") ?: "gemini-3.5-flash-lite")
         box.addView(key); box.addView(model)
         box.addView(btn("Save") {
-            sp.edit().putString("key", key.text.toString().trim()).putString("model", model.text.toString().trim().ifEmpty { "gemini-flash-latest" }).apply()
+            sp.edit().putString("key", key.text.toString().trim()).putString("model", model.text.toString().trim().ifEmpty { "gemini-3.5-flash-lite" }).apply()
             Toast.makeText(this, "Saved", Toast.LENGTH_SHORT).show()
         })
         box.addView(tv("Reminders"))
