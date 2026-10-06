@@ -283,7 +283,11 @@ class MainActivity : Activity() {
     private fun dp(x: Number) = (x.toFloat() * resources.displayMetrics.density).toInt()
     private fun withA(col: Int, a: Int) = Color.argb(a, Color.red(col), Color.green(col), Color.blue(col))
     private fun bg(color: Int, r: Float, stroke: Int = 0, sw: Int = 0) = GradientDrawable().apply {
-        setColor(color); cornerRadius = dp(r).toFloat(); if (sw > 0) setStroke(dp(sw), stroke)
+        setColor(color)
+        cornerRadius = dp(r).toFloat()
+        if (sw > 0) {
+            setStroke(dp(sw), stroke)
+        }
     }
     private fun lp(w: Int, h: Int, l: Int = 0, t: Int = 0, r: Int = 0, b: Int = 0) =
         LinearLayout.LayoutParams(w, h).apply { setMargins(dp(l), dp(t), dp(r), dp(b)) }
@@ -309,7 +313,9 @@ class MainActivity : Activity() {
     private fun field(h: String, v: String = "", lines: Int = 1) = EditText(this).apply {
         hint = h; setText(v); setTextColor(p.ink); setHintTextColor(p.mut); textSize = 16f
         background = bg(p.bg, 12f, p.line, 1); setPadding(dp(12), dp(10), dp(12), dp(10)); minLines = lines
-        if (lines > 1) gravity = Gravity.TOP
+        if (lines > 1) {
+            gravity = Gravity.TOP
+        }
     }
     private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_LONG).show()
 
@@ -368,18 +374,27 @@ class MainActivity : Activity() {
     @Suppress("DEPRECATION")
     private fun lightBars(light: Boolean) {
         var f = 0
-        if (light) f = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
+        if (light) {
+            f = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
+        }
         window.decorView.systemUiVisibility = f
     }
-    override fun onSaveInstanceState(out: Bundle) { super.onSaveInstanceState(out); out.putInt("tab", tab) }
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putInt("tab", tab)
+    }
 
     private fun show() {
         box.removeAllViews()
-        when (tab) { 0 -> today(); 1 -> if (editing != null) form(editing!!) else medsList(); 2 -> aiTab(); else -> settings() }
+        when (tab) {
+            0 -> today()
+            1 -> {
+                val e = editing
+                if (e != null) form(e) else medsList()
+            }
+            2 -> aiTab()
+            else -> settings()
+        }
         nav.removeAllViews()
-        listOf("Today", "Remedies", "Ask AI", "Settings").forEachIndexed { i, n ->
-            val on = tab == i
-            val t = tx(n, 14f, if (on) p.gold else p.mut, bold = on, serif = true).apply {
-                gravity = Gravity.CENTER
-                setPadding(0, dp(10), 0, dp(10))
-  
+        val names = listOf("Today", "Remedies", "Ask AI", "Settings")
+   
