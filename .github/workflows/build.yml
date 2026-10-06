@@ -20,7 +20,15 @@ jobs:
           cp MainActivity.kt app/src/main/java/com/jaby/pillpal/
           cp AndroidManifest.xml app/src/main/
           cp app.gradle.kts app/build.gradle.kts
-      - run: gradle assembleDebug --no-daemon
+          cp debug.keystore app/debug.keystore
+      - name: Build
+        run: |
+          set -o pipefail
+          gradle assembleDebug --no-daemon --console=plain 2>&1 | tee build.log
+      - name: Show errors
+        if: failure()
+        run: |
+          grep -E "^e: " build.log | head -20 | while read -r l; do echo "::error::$l"; done
       - uses: actions/upload-artifact@v4
         with:
           name: PillPal-apk
