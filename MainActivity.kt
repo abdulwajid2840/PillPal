@@ -281,7 +281,7 @@ class MainActivity : Activity() {
 
     // ---------- view helpers ----------
     private fun dp(x: Number) = (x.toFloat() * resources.displayMetrics.density).toInt()
-    private fun alpha(col: Int, a: Int) = Color.argb(a, Color.red(col), Color.green(col), Color.blue(col))
+    private fun withA(col: Int, a: Int) = Color.argb(a, Color.red(col), Color.green(col), Color.blue(col))
     private fun bg(color: Int, r: Float, stroke: Int = 0, sw: Int = 0) = GradientDrawable().apply {
         setColor(color); cornerRadius = dp(r).toFloat(); if (sw > 0) setStroke(dp(sw), stroke)
     }
@@ -294,7 +294,7 @@ class MainActivity : Activity() {
             setPadding(0, dp(2), 0, dp(2))
         }
     private fun chip(s: String, col: Int) = tx(s, 12f, col, bold = true).apply {
-        background = bg(alpha(col, 0x2A), 12f); setPadding(dp(10), dp(4), dp(10), dp(4))
+        background = bg(withA(col, 0x2A), 12f); setPadding(dp(10), dp(4), dp(10), dp(4))
     }
     private fun btn(label: String, fill: Int, textCol: Int, outline: Boolean = false, f: () -> Unit) = Button(this).apply {
         text = label; setAllCaps(false); textSize = 15f; setTextColor(textCol)
@@ -302,7 +302,7 @@ class MainActivity : Activity() {
         minHeight = 0; minimumHeight = dp(44); minWidth = 0; minimumWidth = dp(64)
         stateListAnimator = null; elevation = 0f
         val shape = if (outline) bg(Color.TRANSPARENT, 22f, fill, 1) else bg(fill, 22f)
-        background = RippleDrawable(ColorStateList.valueOf(alpha(fill, 0x33)), shape, null)
+        background = RippleDrawable(ColorStateList.valueOf(withA(fill, 0x33)), shape, null)
         setPadding(dp(18), 0, dp(18), 0)
         setOnClickListener { f() }
     }
