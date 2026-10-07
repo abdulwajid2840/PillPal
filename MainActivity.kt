@@ -24,6 +24,9 @@ import android.view.Gravity
 import android.view.View
 import java.text.SimpleDateFormat
 import java.util.Locale
+import java.util.Date
+import java.time.LocalDate
+import java.time.temporal.ChronoUnit
 import android.provider.Settings
 import android.widget.Button
 import android.widget.CheckBox
@@ -50,7 +53,8 @@ object Core {
         return List(a.length()) { a.getJSONObject(it) }
     }
     fun saveMeds(c: Context, l: List<JSONObject>) {
-        val a = JSONArray(); l.forEach { a.put(it) }
+        val a = JSONArray()
+        l.forEach { a.put(it) }
         sp(c).edit().putString("meds", a.toString()).apply()
     }
     fun med(c: Context, id: String) = meds(c).firstOrNull { it.getString("id") == id }
@@ -58,8 +62,14 @@ object Core {
     fun upsert(c: Context, m: JSONObject) {
         val l = meds(c).toMutableList()
         val i = l.indexOfFirst { it.getString("id") == m.getString("id") }
-        if (i >= 0) { cancelAll(c, l[i]); l[i] = m } else l.add(m)
-        saveMeds(c, l); scheduleAll(c)
+        if (i >= 0) {
+            cancelAll(c, l[i])
+            l[i] = m
+        } else {
+            l.add(m)
+        }
+        saveMeds(c, l)
+        scheduleAll(c)
     }
     fun delete(c: Context, id: String) {
         val l = meds(c).toMutableList()
@@ -67,36 +77,129 @@ object Core {
         saveMeds(c, l.filter { it.getString("id") != id })
     }
 
+    // ---- helpers ----
     fun ymd(c: Calendar) = "%04d-%02d-%02d".format(c.get(Calendar.YEAR), c.get(Calendar.MONTH) + 1, c.get(Calendar.DAY_OF_MONTH))
     fun key(id: String, t: String) = ymd(Calendar.getInstance()) + "|" + id + "|" + t
+    fun mode(m: JSONObject) = m.optString("mode", "times")
+    fun validHm(s: String) = Regex("^([01]?[0-9]|2[0-3]):[0-5][0-9]$").matches(s.trim())
+    fun hm(s: String): Int {
+        val p = s.trim().split(":")
+        return p[0].toInt() * 60 + p[1].toInt()
+    }
+    fun parseInterval(s: String): Int {
+        val r = Regex("^([0-9]+)\\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)?$")
+        val mt = r.find(s.trim().lowercase()) ?: return 0
+        val n = mt.groupValues[1].toIntOrNull() ?: return 0
+        val mult = when (mt.groupValues[2]) {
+            "h", "hr", "hrs", "hour", "hours" -> 60
+            "d", "day", "days" -> 1440
+            else -> 1
+        }
+        return n * mult
+    }
+    fun fmtInterval(min: Int): String {
+        if (min >= 1440 && min % 1440 == 0) return (min / 1440).toString() + " day" + (if (min / 1440 > 1) "s" else "")
+        if (min >= 60 && min % 60 == 0) return (min / 60).toString() + " h"
+        return "$min min"
+    }
+    fun shortInterval(min: Int): String {
+        if (min <= 0) return ""
+        if (min % 60 == 0) return (min / 60).toString() + "h"
+        return min.toString() + "m"
+    }
 
+    // ---- safety hints (never block, only warn) ----
+    fun doseMg(s: String): Double? {
+        val r = Regex("([0-9][0-9,]*\\.?[0-9]*)\\s*(lakh|lac|thousand|k)?\\s*(mg|mcg|g)\\b", RegexOption.IGNORE_CASE)
+        val mt = r.find(s) ?: return null
+        val num = mt.groupValues[1].replace(",", "").toDoubleOrNull() ?: return null
+        val mult = when (mt.groupValues[2].lowercase()) {
+            "lakh", "lac" -> 100000.0
+            "thousand", "k" -> 1000.0
+            else -> 1.0
+        }
+        val unit = when (mt.groupValues[3].lowercase()) {
+            "g" -> 1000.0
+            "mcg" -> 0.001
+            else -> 1.0
+        }
+        return num * mult * unit
+    }
+    fun warn(m: JSONObject): String? {
+        val mg = doseMg(m.optString("dose", ""))
+        if (mg != null && mg > 5000) {
+            return "This dose looks unusually high. Please check it with a doctor or pharmacist before using it."
+        }
+        if (mode(m) == "interval" && m.optInt("intervalMin", 0) in 1..59) {
+            return "Reminders more often than every hour. Make sure this schedule is really what your doctor prescribed."
+        }
+        return null
+    }
+
+    // ---- log ----
     fun getLog(c: Context, k: String): String? = JSONObject(sp(c).getString("log", "{}")).optString(k, "").ifEmpty { null }
+    fun count(c: Context, id: String): Int = getLog(c, key(id, "~"))?.toIntOrNull() ?: 0
+
     fun mark(c: Context, id: String, t: String, st: String) {
         val lg = JSONObject(sp(c).getString("log", "{}"))
         val k = key(id, t)
         val prev = lg.optString(k, "")
-        lg.put(k, st); sp(c).edit().putString("log", lg.toString()).apply()
+        var delta = 0
+        if (t == "~") {
+            val cnt = prev.toIntOrNull() ?: 0
+            if (st == "taken") {
+                lg.put(k, (cnt + 1).toString())
+                delta = 1
+            } else if (st == "" && cnt > 0) {
+                lg.put(k, (cnt - 1).toString())
+                delta = -1
+            }
+        } else {
+            lg.put(k, st)
+            if (st == "taken" && prev != "taken") {
+                delta = 1
+            } else if (st != "taken" && prev == "taken") {
+                delta = -1
+            }
+        }
+        sp(c).edit().putString("log", lg.toString()).apply()
         val m = med(c, id) ?: return
         val stock = m.optInt("stock", -1)
-        if (stock >= 0) {
+        if (delta != 0 && stock >= 0) {
             val per = m.optInt("per", 1)
-            val ns = if (st == "taken" && prev != "taken") maxOf(0, stock - per)
-                else if (st != "taken" && prev == "taken") stock + per else stock
-            if (ns != stock) {
-                m.put("stock", ns)
-                saveMeds(c, meds(c).map { if (it.getString("id") == id) m else it })
-            }
+            m.put("stock", if (delta > 0) maxOf(0, stock - per) else stock + per)
+            saveMeds(c, meds(c).map { if (it.getString("id") == id) m else it })
         }
     }
 
+    // ---- when is a remedy active on a day ----
     fun activeOn(m: JSONObject, cal: Calendar): Boolean {
+        val day = ymd(cal)
         val end = m.optString("end", "")
-        return cal.get(Calendar.DAY_OF_WEEK) in ints(m.getJSONArray("days")) && (end == "" || ymd(cal) <= end)
+        val start = m.optString("start", "")
+        if (end != "" && day > end) return false
+        if (start != "" && day < start) return false
+        if (cal.get(Calendar.DAY_OF_WEEK) !in ints(m.getJSONArray("days"))) return false
+        val sd = runCatching { LocalDate.parse(start) }.getOrNull()
+        if (sd != null) {
+            val today = LocalDate.of(cal.get(Calendar.YEAR), cal.get(Calendar.MONTH) + 1, cal.get(Calendar.DAY_OF_MONTH))
+            val idx = ChronoUnit.DAYS.between(sd, today).toInt()
+            val every = m.optInt("every", 1).coerceAtLeast(1)
+            if (idx % every != 0) return false
+            val on = m.optInt("cycleOn", 0)
+            val off = m.optInt("cycleOff", 0)
+            if (on > 0 && off > 0 && (idx / every) % (on + off) >= on) return false
+        }
+        return true
     }
     fun dosesToday(c: Context): List<Pair<JSONObject, String>> {
         val now = Calendar.getInstance()
-        return meds(c).filter { activeOn(it, now) }
+        return meds(c).filter { mode(it) == "times" && activeOn(it, now) }
             .flatMap { m -> strs(m.getJSONArray("times")).map { m to it } }.sortedBy { it.second }
+    }
+    fun repeatingToday(c: Context): List<JSONObject> {
+        val now = Calendar.getInstance()
+        return meds(c).filter { mode(it) != "times" && activeOn(it, now) }
     }
 
     // ---- alarms ----
@@ -105,29 +208,59 @@ object Core {
         Intent(c, AlarmReceiver::class.java).setData(Uri.parse("pp://alarm/$id/$t")).putExtra("id", id).putExtra("t", t),
         PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
     )
-    fun next(m: JSONObject, t: String): Long? {
-        val (h, mi) = t.split(":").map { it.toInt() }
-        for (d in 0..8) {
-            val c = Calendar.getInstance().apply {
-                add(Calendar.DAY_OF_YEAR, d)
-                set(Calendar.HOUR_OF_DAY, h); set(Calendar.MINUTE, mi); set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0)
-            }
-            if (c.timeInMillis > System.currentTimeMillis() + 1000 && activeOn(m, c)) return c.timeInMillis
+    private fun dayStart(d: Int): Calendar = Calendar.getInstance().apply {
+        add(Calendar.DAY_OF_YEAR, d)
+        set(Calendar.HOUR_OF_DAY, 0); set(Calendar.MINUTE, 0); set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0)
+    }
+    fun nextTime(m: JSONObject, t: String): Long? {
+        val mins = hm(t)
+        val nowMs = System.currentTimeMillis()
+        for (d in 0..400) {
+            val day = dayStart(d)
+            if (!activeOn(m, day)) continue
+            val at = day.timeInMillis + mins * 60000L
+            if (at > nowMs + 1000) return at
+        }
+        return null
+    }
+    fun nextInterval(m: JSONObject): Long? {
+        val iv = m.optInt("intervalMin", 0)
+        if (iv < 1) return null
+        val s = hm(m.optString("winStart", "00:00"))
+        val e = hm(m.optString("winEnd", "23:59"))
+        val step = iv * 60000L
+        val nowMs = System.currentTimeMillis() + 1000
+        for (d in 0..400) {
+            val day = dayStart(d)
+            if (!activeOn(m, day)) continue
+            val first = day.timeInMillis + s * 60000L
+            val k = if (nowMs >= first) (nowMs - first) / step + 1 else 0L
+            val slot = first + k * step
+            if (slot > nowMs - 1000 + 1000 && slot <= day.timeInMillis + e * 60000L + 59000L) return slot
         }
         return null
     }
     fun scheduleOne(c: Context, m: JSONObject, t: String) {
-        val at = next(m, t) ?: return
+        val at = (if (t == "~") nextInterval(m) else nextTime(m, t)) ?: return
         val am = c.getSystemService(AlarmManager::class.java)
         val p = pi(c, m.getString("id"), t)
-        if (Build.VERSION.SDK_INT < 31 || am.canScheduleExactAlarms())
+        if (Build.VERSION.SDK_INT < 31 || am.canScheduleExactAlarms()) {
             am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, p)
-        else am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, p)
+        } else {
+            am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, p)
+        }
     }
-    fun scheduleAll(c: Context) = meds(c).forEach { m -> strs(m.getJSONArray("times")).forEach { scheduleOne(c, m, it) } }
+    fun scheduleMed(c: Context, m: JSONObject) {
+        when (mode(m)) {
+            "times" -> strs(m.getJSONArray("times")).forEach { scheduleOne(c, m, it) }
+            "interval" -> scheduleOne(c, m, "~")
+        }
+    }
+    fun scheduleAll(c: Context) = meds(c).forEach { scheduleMed(c, it) }
     fun cancelAll(c: Context, m: JSONObject) {
         val am = c.getSystemService(AlarmManager::class.java)
         strs(m.getJSONArray("times")).forEach { am.cancel(pi(c, m.getString("id"), it)) }
+        am.cancel(pi(c, m.getString("id"), "~"))
     }
 
     // ---- notifications ----
@@ -138,7 +271,8 @@ object Core {
     }
     fun notify(c: Context, m: JSONObject, t: String) {
         channel(c)
-        val id = m.getString("id"); val nid = (id + t).hashCode()
+        val id = m.getString("id")
+        val nid = (id + t).hashCode()
         fun act(st: String, label: String): Notification.Action {
             val i = Intent(c, ActionReceiver::class.java).setData(Uri.parse("pp://act/$id/$t/$st"))
                 .putExtra("id", id).putExtra("t", t).putExtra("st", st).putExtra("n", nid)
@@ -148,10 +282,11 @@ object Core {
         val open = PendingIntent.getActivity(c, 0, Intent(c, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
         val stock = m.optInt("stock", -1)
         val low = if (stock in 0..5) " · only $stock left" else ""
+        val extra = if (t == "~") "Every " + fmtInterval(m.optInt("intervalMin", 0)) else m.optString("notes")
         val n = Notification.Builder(c, "meds")
             .setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
             .setContentTitle("Time for " + m.getString("name"))
-            .setContentText((m.optString("dose") + " " + m.optString("notes") + low).trim())
+            .setContentText((m.optString("dose") + " " + extra + low).trim())
             .setAutoCancel(true).setContentIntent(open)
             .addAction(act("taken", "Taken")).addAction(act("skipped", "Skip"))
             .build()
@@ -159,7 +294,7 @@ object Core {
     }
 
     // ---- backup ----
-    fun exportJson(c: Context): String = JSONObject().put("app", "PillPal").put("version", 1)
+    fun exportJson(c: Context): String = JSONObject().put("app", "PillPal").put("version", 2)
         .put("meds", JSONArray(sp(c).getString("meds", "[]")))
         .put("log", JSONObject(sp(c).getString("log", "{}"))).toString(2)
     fun importJson(c: Context, txt: String): Int {
@@ -178,9 +313,10 @@ object Core {
     // ---- Gemini ----
     fun ask(key: String, model: String, q: String): List<JSONObject> {
         val prompt = """Extract medicine schedules from the text. Return ONLY a JSON array of objects:
-{"name":string,"dose":string,"unitsPerDose":number,"times":["HH:MM" 24h],"days":[1-7, Sunday=1 ... Saturday=7; all seven if daily],"durationDays":number or null,"stock":number or null,"notes":string}
-Defaults: once daily 08:00; twice daily 08:00,20:00; thrice daily 08:00,14:00,20:00; morning 08:00; afternoon 14:00; evening 18:00; night 21:00; after breakfast 09:00; after lunch 14:00; after dinner 21:00.
-Never invent medicines or doses that are not in the text.
+{"name":string,"dose":string (copy exactly as written),"unitsPerDose":number,"mode":"times" or "interval" or "asneeded","times":["HH:MM" 24h] (for mode times),"intervalMinutes":number (for mode interval),"windowStart":"HH:MM","windowEnd":"HH:MM" (for mode interval; default 00:00 and 23:59),"days":[1-7, Sunday=1 ... Saturday=7; all seven if daily],"everyNDays":number (1 if every day),"cycleOnDays":number or null,"cycleOffDays":number or null,"durationDays":number or null,"stock":number or null,"notes":string}
+Rules: "every 5 min" means mode interval with intervalMinutes 5. "every 8 hours" means interval 480. "as needed", "if fever", "SOS" mean mode asneeded. "alternate days" means everyNDays 2. "5 days on, 2 days off" means cycleOnDays 5 and cycleOffDays 2.
+Defaults for mode times: once daily 08:00; twice daily 08:00,20:00; thrice daily 08:00,14:00,20:00; morning 08:00; afternoon 14:00; evening 18:00; night 21:00; after breakfast 09:00; after lunch 14:00; after dinner 21:00.
+Use exactly the numbers the user gave. Never change a dose or frequency and never invent medicines.
 Text: $q"""
         val body = JSONObject()
             .put("contents", JSONArray().put(JSONObject().put("parts", JSONArray().put(JSONObject().put("text", prompt)))))
@@ -207,18 +343,33 @@ Text: $q"""
             .getJSONArray("parts").getJSONObject(0).getString("text").trim()
             .removePrefix("```json").removePrefix("```").removeSuffix("```").trim()
         val arr = if (out.startsWith("[")) JSONArray(out) else JSONArray().put(JSONObject(out))
+        val today = ymd(Calendar.getInstance())
         return List(arr.length()) { i ->
             val a = arr.getJSONObject(i)
-            val end = a.optInt("durationDays", 0).let { d ->
-                if (d > 0) ymd(Calendar.getInstance().apply { add(Calendar.DAY_OF_YEAR, d - 1) }) else ""
-            }
+            val dur = a.optInt("durationDays", 0)
+            val end = if (dur > 0) ymd(Calendar.getInstance().apply { add(Calendar.DAY_OF_YEAR, dur - 1) }) else ""
+            var md = a.optString("mode", "times")
+            val iv = a.optInt("intervalMinutes", 0)
+            if (md !in listOf("times", "interval", "asneeded")) md = "times"
+            if (md == "interval" && iv < 1) md = "times"
+            val ts = (a.optJSONArray("times") ?: JSONArray()).let { arr2 -> strs(arr2).filter { validHm(it) }.map { it.padStart(5, '0') } }
+            val ws = a.optString("windowStart", "00:00").let { if (validHm(it)) it else "00:00" }
+            val we = a.optString("windowEnd", "23:59").let { if (validHm(it)) it else "23:59" }
             JSONObject()
                 .put("id", "m" + System.currentTimeMillis() + i)
                 .put("name", a.optString("name", "Medicine"))
                 .put("dose", a.optString("dose", ""))
                 .put("per", a.optInt("unitsPerDose", 1).coerceAtLeast(1))
-                .put("times", a.optJSONArray("times") ?: JSONArray().put("08:00"))
+                .put("mode", md)
+                .put("times", JSONArray(if (ts.isEmpty()) listOf("08:00") else ts))
+                .put("intervalMin", if (md == "interval") iv else 0)
+                .put("winStart", if (ws <= we) ws else "00:00")
+                .put("winEnd", if (ws <= we) we else "23:59")
                 .put("days", a.optJSONArray("days")?.takeIf { it.length() > 0 } ?: JSONArray(listOf(1, 2, 3, 4, 5, 6, 7)))
+                .put("every", a.optInt("everyNDays", 1).coerceAtLeast(1))
+                .put("cycleOn", a.optInt("cycleOnDays", 0))
+                .put("cycleOff", a.optInt("cycleOffDays", 0))
+                .put("start", today)
                 .put("end", end)
                 .put("stock", if (a.isNull("stock")) -1 else a.optInt("stock", -1))
                 .put("notes", a.optString("notes", ""))
@@ -232,7 +383,12 @@ class AlarmReceiver : BroadcastReceiver() {
         val id = i.getStringExtra("id") ?: return
         val t = i.getStringExtra("t") ?: return
         val m = Core.med(c, id) ?: return
-        if (t !in Core.strs(m.getJSONArray("times"))) return
+        val md = Core.mode(m)
+        if (t == "~") {
+            if (md != "interval") return
+        } else if (md != "times" || t !in Core.strs(m.getJSONArray("times"))) {
+            return
+        }
         Core.notify(c, m, t)
         Core.scheduleOne(c, m, t)
     }
@@ -360,8 +516,24 @@ class MainActivity : Activity() {
     private fun describe(m: JSONObject): String {
         val dn = listOf("Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat")
         val d = Core.ints(m.getJSONArray("days"))
-        return Core.strs(m.getJSONArray("times")).joinToString(", ") + " · " +
-            (if (d.size == 7) "every day" else d.joinToString(" ") { dn[it - 1] })
+        val md = Core.mode(m)
+        if (md == "asneeded") {
+            return "As needed"
+        }
+        val head = if (md == "interval") {
+            "Every " + Core.fmtInterval(m.optInt("intervalMin", 0)) + " · " + m.optString("winStart", "00:00") + "–" + m.optString("winEnd", "23:59")
+        } else {
+            Core.strs(m.getJSONArray("times")).joinToString(", ")
+        }
+        var s = head + " · " + (if (d.size == 7) "every day" else d.joinToString(" ") { dn[it - 1] })
+        val ev = m.optInt("every", 1)
+        if (ev > 1) {
+            s += " · every $ev days"
+        }
+        if (m.optInt("cycleOn", 0) > 0 && m.optInt("cycleOff", 0) > 0) {
+            s += " · " + m.optInt("cycleOn") + " on / " + m.optInt("cycleOff") + " off"
+        }
+        return s
     }
 
     // ---------- lifecycle ----------
@@ -450,14 +622,15 @@ class MainActivity : Activity() {
         val now = Calendar.getInstance()
         heading("Today", SimpleDateFormat("EEEE, d MMMM", Locale.getDefault()).format(now.time))
         val ds = Core.dosesToday(this)
+        val rep = Core.repeatingToday(this)
         val stat = ds.map { Core.getLog(this, Core.key(it.first.getString("id"), it.second)) }
         val done = stat.count { it != null }
-        if (ds.isEmpty()) {
+        if (ds.isEmpty() && rep.isEmpty()) {
             addCard(p.gold) {
                 addView(tx("A quiet day", 18f, p.ink, bold = true, serif = true))
                 addView(tx("Nothing is scheduled. Add a remedy under Remedies or Ask AI.", 14f, p.mut))
             }
-        } else {
+        } else if (ds.isNotEmpty()) {
             addCard(p.gold) {
                 addView(tx("$done of ${ds.size} doses marked", 15f, p.mut, italic = true, serif = true))
                 val bar = LinearLayout(context).apply { background = bg(p.line, 6f); clipToOutline = true }
@@ -476,14 +649,21 @@ class MainActivity : Activity() {
         val nextIdx = ds.indices.firstOrNull { stat[it] == null && ds[it].second >= nowS }
             ?: ds.indices.firstOrNull { stat[it] == null } ?: -1
         ds.forEachIndexed { i, (m, t) ->
-            val id = m.getString("id"); val st = stat[i]; val col = medColor(id); val isNext = i == nextIdx
+            val id = m.getString("id")
+            val st = stat[i]
+            val col = medColor(id)
+            val isNext = i == nextIdx
             addCard(col, isNext) {
                 val top = LinearLayout(context).apply { gravity = Gravity.CENTER_VERTICAL }
                 top.addView(tx(t, 24f, p.time, bold = true, serif = true))
                 top.addView(View(context), LinearLayout.LayoutParams(0, 1, 1f))
-                if (st == "taken") top.addView(chip("✓ Taken", p.ok))
-                else if (st == "skipped") top.addView(chip("Skipped", p.bad))
-                else if (isNext) top.addView(chip("Next dose", p.gold))
+                if (st == "taken") {
+                    top.addView(chip("✓ Taken", p.ok))
+                } else if (st == "skipped") {
+                    top.addView(chip("Skipped", p.bad))
+                } else if (isNext) {
+                    top.addView(chip("Next dose", p.gold))
+                }
                 addView(top)
                 addView(tx(m.getString("name"), 20f, p.ink, bold = true, serif = true))
                 if (m.optString("dose") != "") addView(tx(m.optString("dose"), 15f, col, bold = true))
@@ -503,16 +683,49 @@ class MainActivity : Activity() {
                 addView(r)
             }
         }
+        rep.forEach { m ->
+            val id = m.getString("id")
+            val col = medColor(id)
+            val n = Core.count(this, id)
+            val isIv = Core.mode(m) == "interval"
+            addCard(col) {
+                val top = LinearLayout(context).apply { gravity = Gravity.CENTER_VERTICAL }
+                top.addView(chip(if (isIv) "Repeating" else "As needed", p.time))
+                top.addView(View(context), LinearLayout.LayoutParams(0, 1, 1f))
+                top.addView(chip("Taken today: $n", if (n > 0) p.ok else p.mut))
+                addView(top, lp(-1, -2, 0, 0, 0, 4))
+                addView(tx(m.getString("name"), 20f, p.ink, bold = true, serif = true))
+                if (m.optString("dose") != "") addView(tx(m.optString("dose"), 15f, col, bold = true))
+                addView(tx(describe(m), 14f, p.time))
+                if (isIv) {
+                    val nx = Core.nextInterval(m)
+                    val label = if (nx == null) "No more reminders" else "Next reminder " + SimpleDateFormat("EEE HH:mm", Locale.getDefault()).format(Date(nx))
+                    addView(tx(label, 13f, p.mut, italic = true, serif = true))
+                }
+                if (m.optString("notes") != "") addView(tx(m.optString("notes"), 14f, p.mut, italic = true, serif = true))
+                val w = Core.warn(m)
+                if (w != null) addView(tx(w, 13f, p.bad, italic = true, serif = true))
+                val r = LinearLayout(context)
+                r.addView(btn(if (isIv) "Log dose" else "Take now", p.ok, p.onAcc) { Core.mark(this@MainActivity, id, "~", "taken"); show() }, lp(-2, -2, 0, 10, 8, 0))
+                if (n > 0) r.addView(btn("Undo", p.mut, p.mut, true) { Core.mark(this@MainActivity, id, "~", ""); show() }, lp(-2, -2, 0, 10, 0, 0))
+                addView(r)
+            }
+        }
     }
 
     // ---------- Remedies ----------
+    private fun newMed(): JSONObject = JSONObject().put("id", "m" + System.currentTimeMillis()).put("name", "").put("dose", "").put("per", 1)
+        .put("mode", "times").put("times", JSONArray().put("08:00")).put("intervalMin", 0)
+        .put("winStart", "00:00").put("winEnd", "23:59")
+        .put("days", JSONArray(listOf(1, 2, 3, 4, 5, 6, 7))).put("every", 1).put("cycleOn", 0).put("cycleOff", 0)
+        .put("start", Core.ymd(Calendar.getInstance())).put("end", "").put("stock", -1).put("notes", "").put("isNew", true)
+
     private fun medsList() {
         heading("Remedies", "Your medicine shelf")
         box.addView(btn("+ Add remedy", p.gold, p.onAcc) {
-            editing = JSONObject().put("id", "m" + System.currentTimeMillis()).put("name", "").put("dose", "").put("per", 1)
-                .put("times", JSONArray().put("08:00")).put("days", JSONArray(listOf(1, 2, 3, 4, 5, 6, 7)))
-                .put("end", "").put("stock", -1).put("notes", "").put("isNew", true)
-            scroll.scrollTo(0, 0); show()
+            editing = newMed()
+            scroll.scrollTo(0, 0)
+            show()
         }, lp(-2, -2, 0, 4, 0, 8))
         val l = Core.meds(this)
         if (l.isEmpty()) addCard(p.gold) { addView(tx("The shelf is empty. Add a remedy by hand or with Ask AI.", 14f, p.mut)) }
@@ -524,6 +737,8 @@ class MainActivity : Activity() {
                 addView(tx(describe(m), 14f, p.time))
                 if (m.optString("end") != "") addView(tx("Until " + m.optString("end"), 13f, p.mut, italic = true, serif = true))
                 if (m.optString("notes") != "") addView(tx(m.optString("notes"), 14f, p.mut, italic = true, serif = true))
+                val w = Core.warn(m)
+                if (w != null) addView(tx(w, 13f, p.bad, italic = true, serif = true))
                 val sk = m.optInt("stock", -1)
                 if (sk >= 0) addView(chip("Stock $sk", if (sk <= 5) p.bad else p.ok), lp(-2, -2, 0, 6, 0, 0))
                 addView(btn("Edit", p.gold, p.gold, true) { editing = m; scroll.scrollTo(0, 0); show() }, lp(-2, -2, 0, 10, 0, 0))
@@ -533,43 +748,135 @@ class MainActivity : Activity() {
 
     private fun form(m: JSONObject) {
         val isNew = m.optBoolean("isNew")
+        val mode = Core.mode(m)
         heading(if (isNew) "New remedy" else "Edit remedy", "Fill in the details")
-        val name = field("Name", m.getString("name")); val dose = field("Dose (e.g. 500 mg)", m.optString("dose"))
+        val name = field("Name", m.getString("name"))
+        val dose = field("Dose (e.g. 500 mg)", m.optString("dose"))
         val per = field("Units per dose", m.optInt("per", 1).toString())
         val times = field("Times, comma separated (08:00,20:00)", Core.strs(m.getJSONArray("times")).joinToString(","))
+        val ival = field("Repeat every (e.g. 5m, 30m, 8h)", Core.shortInterval(m.optInt("intervalMin", 0)))
+        val ws = field("From (HH:MM)", m.optString("winStart", "00:00"))
+        val we = field("Until (HH:MM)", m.optString("winEnd", "23:59"))
+        val every = field("Repeat every N days (1 = daily)", m.optInt("every", 1).toString())
+        val con = field("Cycle: days on (optional)", if (m.optInt("cycleOn", 0) > 0) m.optInt("cycleOn").toString() else "")
+        val coff = field("Cycle: days off (optional)", if (m.optInt("cycleOff", 0) > 0) m.optInt("cycleOff").toString() else "")
+        val start = field("Start date yyyy-mm-dd", m.optString("start"))
         val end = field("Last day yyyy-mm-dd (optional)", m.optString("end"))
         val stock = field("Stock in units (optional)", if (m.optInt("stock", -1) >= 0) m.getInt("stock").toString() else "")
         val notes = field("Notes (e.g. after food)", m.optString("notes"))
         val dn = listOf("Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat")
         val cur = Core.ints(m.getJSONArray("days"))
         val cbs = dn.mapIndexed { i, n ->
-            CheckBox(this).apply { text = n; isChecked = (i + 1) in cur; textSize = 10f; setTextColor(p.ink); buttonTintList = ColorStateList.valueOf(p.gold) }
+            CheckBox(this).apply {
+                text = n
+                isChecked = (i + 1) in cur
+                textSize = 10f
+                setTextColor(p.ink)
+                buttonTintList = ColorStateList.valueOf(p.gold)
+            }
         }
         val dayRow = LinearLayout(this)
         cbs.forEach { dayRow.addView(it, LinearLayout.LayoutParams(0, -2, 1f)) }
+
+        fun collect() {
+            m.put("name", name.text.toString().trim())
+            m.put("dose", dose.text.toString())
+            m.put("per", per.text.toString().toIntOrNull() ?: 1)
+            val ts = times.text.toString().split(",").map { it.trim() }.filter { Core.validHm(it) }.map { it.padStart(5, '0') }.sorted()
+            m.put("times", JSONArray(ts))
+            m.put("intervalMin", Core.parseInterval(ival.text.toString()))
+            m.put("winStart", ws.text.toString().trim())
+            m.put("winEnd", we.text.toString().trim())
+            m.put("days", JSONArray(cbs.indices.filter { cbs[it].isChecked }.map { it + 1 }))
+            m.put("every", every.text.toString().toIntOrNull() ?: 1)
+            m.put("cycleOn", con.text.toString().toIntOrNull() ?: 0)
+            m.put("cycleOff", coff.text.toString().toIntOrNull() ?: 0)
+            m.put("start", start.text.toString().trim())
+            m.put("end", end.text.toString().trim())
+            m.put("stock", stock.text.toString().toIntOrNull() ?: -1)
+            m.put("notes", notes.text.toString())
+        }
+        fun validate(): String? {
+            val md = Core.mode(m)
+            if (m.getString("name").isBlank()) return "Enter a name"
+            if (md != "asneeded" && m.getJSONArray("days").length() == 0) return "Pick at least one day"
+            if (md == "times" && m.getJSONArray("times").length() == 0) return "Add at least one time like 08:00"
+            if (md == "interval") {
+                if (m.optInt("intervalMin", 0) < 1) return "Enter how often, like 5m or 8h"
+                val a = m.optString("winStart")
+                val b = m.optString("winEnd")
+                if (!Core.validHm(a) || !Core.validHm(b)) return "From and Until must look like 08:00"
+                if (Core.hm(a) > Core.hm(b)) return "Until must be later than From"
+            }
+            for (d in listOf(m.optString("start"), m.optString("end"))) {
+                if (d != "" && !Regex("[0-9]{4}-[0-9]{2}-[0-9]{2}").matches(d)) return "Dates look like 2026-10-31"
+            }
+            return null
+        }
+
+        val modeRow = LinearLayout(this)
+        listOf("times" to "Fixed times", "interval" to "Repeating", "asneeded" to "As needed").forEach { (k, n) ->
+            val b = if (mode == k) btn(n, p.gold, p.onAcc) { } else btn(n, p.mut, p.mut, true) {
+                collect()
+                m.put("mode", k)
+                show()
+            }
+            b.textSize = 13f
+            b.setPadding(dp(6), 0, dp(6), 0)
+            modeRow.addView(b, lp(0, -2, 0, 0, 6, 0).apply { weight = 1f })
+        }
+
         addCard(p.gold) {
-            for (v in listOf<View>(name, dose, per, times, end, stock, notes)) addView(v, lp(-1, -2, 0, 6, 0, 0))
-            addView(tx("Days", 13f, p.mut, italic = true, serif = true), lp(-2, -2, 0, 10, 0, 0))
-            addView(dayRow)
+            for (v in listOf<View>(name, dose, per)) addView(v, lp(-1, -2, 0, 6, 0, 0))
+            addView(tx("Schedule type", 13f, p.mut, italic = true, serif = true), lp(-2, -2, 0, 10, 0, 0))
+            addView(modeRow, lp(-1, -2, 0, 4, 0, 0))
+            if (mode == "times") {
+                addView(times, lp(-1, -2, 0, 6, 0, 0))
+            }
+            if (mode == "interval") {
+                addView(ival, lp(-1, -2, 0, 6, 0, 0))
+                addView(tx("Only between these times each day", 13f, p.mut, italic = true, serif = true), lp(-2, -2, 0, 8, 0, 0))
+                addView(ws, lp(-1, -2, 0, 4, 0, 0))
+                addView(we, lp(-1, -2, 0, 6, 0, 0))
+            }
+            if (mode != "asneeded") {
+                addView(tx("Days of the week", 13f, p.mut, italic = true, serif = true), lp(-2, -2, 0, 10, 0, 0))
+                addView(dayRow)
+                addView(every, lp(-1, -2, 0, 6, 0, 0))
+                addView(con, lp(-1, -2, 0, 6, 0, 0))
+                addView(coff, lp(-1, -2, 0, 6, 0, 0))
+            }
+            for (v in listOf<View>(start, end, stock, notes)) addView(v, lp(-1, -2, 0, 6, 0, 0))
             val r = LinearLayout(context)
             r.addView(btn("Save", p.gold, p.onAcc) {
-                val ts = times.text.toString().split(",").map { it.trim() }.filter { Regex("\\d{1,2}:\\d{2}").matches(it) }
-                    .map { it.padStart(5, '0') }.sorted()
-                val ds = cbs.indices.filter { cbs[it].isChecked }.map { it + 1 }
-                if (name.text.isBlank() || ts.isEmpty() || ds.isEmpty()) {
-                    toast("Need a name, a time like 08:00, and at least one day")
+                collect()
+                if (m.optString("start") == "") m.put("start", Core.ymd(Calendar.getInstance()))
+                val err = validate()
+                if (err != null) {
+                    toast(err)
                 } else {
-                    val o = JSONObject().put("id", m.getString("id")).put("name", name.text.toString().trim())
-                        .put("dose", dose.text.toString()).put("per", per.text.toString().toIntOrNull() ?: 1)
-                        .put("times", JSONArray(ts)).put("days", JSONArray(ds)).put("end", end.text.toString().trim())
-                        .put("stock", stock.text.toString().toIntOrNull() ?: -1).put("notes", notes.text.toString())
-                    Core.upsert(this@MainActivity, o); editing = null; show()
+                    val doSave = {
+                        m.remove("isNew")
+                        Core.upsert(this@MainActivity, m)
+                        editing = null
+                        show()
+                    }
+                    val w = Core.warn(m)
+                    if (w == null) {
+                        doSave()
+                    } else {
+                        AlertDialog.Builder(this@MainActivity).setTitle("Please double-check").setMessage(w)
+                            .setPositiveButton("Save anyway") { _, _ -> doSave() }
+                            .setNegativeButton("Edit", null).show()
+                    }
                 }
             }, lp(-2, -2, 0, 12, 8, 0))
             r.addView(btn("Cancel", p.mut, p.mut, true) { editing = null; show() }, lp(-2, -2, 0, 12, 0, 0))
             addView(r)
             if (!isNew) addView(btn("Delete remedy", p.bad, p.bad, true) {
-                Core.delete(this@MainActivity, m.getString("id")); editing = null; show()
+                Core.delete(this@MainActivity, m.getString("id"))
+                editing = null
+                show()
             }, lp(-2, -2, 0, 10, 0, 0))
         }
     }
@@ -577,9 +884,9 @@ class MainActivity : Activity() {
     // ---------- Ask AI ----------
     private fun aiTab() {
         heading("Ask AI", "Describe it, and the scribe fills the schedule")
-        val q = field("e.g. Metformin 500mg after breakfast and dinner for 30 days, 60 tablets", aiText, 4)
+        val q = field("e.g. Amoxicillin 500mg every 8 hours for 5 days", aiText, 4)
         addCard(p.gold) {
-            addView(tx("You can also paste text from a prescription.", 14f, p.mut, italic = true, serif = true))
+            addView(tx("Fixed times, every few minutes or hours, every other day, on/off cycles, or as needed. You can also paste prescription text.", 14f, p.mut, italic = true, serif = true))
             addView(q, lp(-1, -2, 0, 8, 0, 0))
             addView(btn("Create with AI", p.gold, p.onAcc) { runAI(q.text.toString()) }, lp(-2, -2, 0, 10, 0, 0))
             if (aiMsg != "") addView(tx(aiMsg, 14f, p.time, italic = true, serif = true), lp(-2, -2, 0, 8, 0, 0))
@@ -593,12 +900,19 @@ class MainActivity : Activity() {
                 if (m.optString("end") != "") addView(tx("Until " + m.optString("end"), 13f, p.mut, italic = true, serif = true))
                 if (m.optInt("stock", -1) >= 0) addView(tx("Stock " + m.getInt("stock"), 13f, p.ok))
                 if (m.optString("notes") != "") addView(tx(m.optString("notes"), 14f, p.mut, italic = true, serif = true))
+                val w = Core.warn(m)
+                if (w != null) addView(tx(w, 13f, p.bad, italic = true, serif = true))
             }
         }
         if (ai.isNotEmpty()) {
             val r = LinearLayout(this)
             r.addView(btn("Save all ${ai.size}", p.ok, p.onAcc) {
-                ai.forEach { Core.upsert(this, it) }; ai = emptyList(); aiMsg = "Saved."; aiText = ""; tab = 0; show()
+                ai.forEach { Core.upsert(this, it) }
+                ai = emptyList()
+                aiMsg = "Saved."
+                aiText = ""
+                tab = 0
+                show()
             }, lp(-2, -2, 0, 6, 8, 0))
             r.addView(btn("Discard", p.mut, p.mut, true) { ai = emptyList(); aiMsg = ""; show() }, lp(-2, -2, 0, 6, 0, 0))
             box.addView(r)
