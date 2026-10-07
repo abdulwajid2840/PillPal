@@ -266,15 +266,29 @@ class MainActivity : Activity() {
 
     // ---------- theme ----------
     private fun c(s: String) = Color.parseColor(s)
-    private fun isDark(): Boolean = when (Core.sp(this).getString("theme", "system")) {
-        "dark" -> true
-        "light" -> false
-        else -> (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
+    private fun isDark(): Boolean {
+        val choice = Core.sp(this).getString("theme", "system")
+        if (choice == "dark") {
+            return true
+        }
+        if (choice == "light") {
+            return false
+        }
+        val mode = resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK
+        return mode == Configuration.UI_MODE_NIGHT_YES
     }
-    private fun pal(dark: Boolean) = if (dark)
-        Pal(true, c("#1B1712"), c("#2A241C"), c("#EFE4CC"), c("#A99A80"), c("#D8AE62"), c("#8DB27C"), c("#E08A7B"), c("#8FAAD0"), c("#3E352A"), c("#3A2F1F"), c("#1B1712"))
-    else
-        Pal(false, c("#F2E8D0"), c("#FBF6E9"), c("#3A2E26"), c("#7C6C57"), c("#9A6B2F"), c("#5B7A4A"), c("#A8473C"), c("#3E5C86"), c("#DCCBA6"), c("#F6E7BF"), c("#FFF8E8"))
+    private fun darkPal(): Pal {
+        return Pal(true, c("#1B1712"), c("#2A241C"), c("#EFE4CC"), c("#A99A80"), c("#D8AE62"), c("#8DB27C"), c("#E08A7B"), c("#8FAAD0"), c("#3E352A"), c("#3A2F1F"), c("#1B1712"))
+    }
+    private fun lightPal(): Pal {
+        return Pal(false, c("#F2E8D0"), c("#FBF6E9"), c("#3A2E26"), c("#7C6C57"), c("#9A6B2F"), c("#5B7A4A"), c("#A8473C"), c("#3E5C86"), c("#DCCBA6"), c("#F6E7BF"), c("#FFF8E8"))
+    }
+    private fun pal(dark: Boolean): Pal {
+        if (dark) {
+            return darkPal()
+        }
+        return lightPal()
+    }
     private val medLight = listOf("#B5483A", "#3D5A80", "#4F7A5A", "#C98B2B", "#8C4A6B", "#7A5C3E")
     private val medDark = listOf("#E07A68", "#86A8D4", "#80B68E", "#E6B456", "#CC8FB0", "#BE9A78")
     private fun medColor(id: String) = c((if (p.dark) medDark else medLight)[(id.hashCode() and 0x7fffffff) % 6])
@@ -386,15 +400,307 @@ class MainActivity : Activity() {
 
     private fun show() {
         box.removeAllViews()
-        when (tab) {
-            0 -> today()
-            1 -> {
-                val e = editing
-                if (e != null) form(e) else medsList()
+        renderTab()
+        buildNav()
+    }
+
+    private fun renderTab() {
+        val e = editing
+        if (tab == 0) {
+            today()
+        } else if (tab == 1) {
+            if (e != null) {
+                form(e)
+            } else {
+                medsList()
             }
-            2 -> aiTab()
-            else -> settings()
+        } else if (tab == 2) {
+            aiTab()
+        } else {
+            settings()
         }
+    }
+
+    private fun buildNav() {
         nav.removeAllViews()
         val names = listOf("Today", "Remedies", "Ask AI", "Settings")
-   
+        for (i in names.indices) {
+            val on = (tab == i)
+            val tc = if (on) p.gold else p.mut
+            val t = tx(names[i], 14f, tc, bold = on, serif = true)
+            t.gravity = Gravity.CENTER
+            t.setPadding(0, dp(10), 0, dp(10))
+            if (on) {
+                t.background = bg(p.hi, 20f, p.gold, 1)
+            }
+            t.setOnClickListener {
+                tab = i
+                editing = null
+                scroll.scrollTo(0, 0)
+                show()
+            }
+            val params = lp(0, -2, 4, 0, 4, 0)
+            params.weight = 1f
+            nav.addView(t, params)
+        }
+    }
+
+    // ---------- Today ----------
+    private fun today() {
+        val now = Calendar.getInstance()
+        heading("Today", SimpleDateFormat("EEEE, d MMMM", Locale.getDefault()).format(now.time))
+        val ds = Core.dosesToday(this)
+        val stat = ds.map { Core.getLog(this, Core.key(it.first.getString("id"), it.second)) }
+        val done = stat.count { it != null }
+        if (ds.isEmpty()) {
+            addCard(p.gold) {
+                addView(tx("A quiet day", 18f, p.ink, bold = true, serif = true))
+                addView(tx("Nothing is scheduled. Add a remedy under Remedies or Ask AI.", 14f, p.mut))
+            }
+        } else {
+            addCard(p.gold) {
+                addView(tx("$done of ${ds.size} doses marked", 15f, p.mut, italic = true, serif = true))
+                val bar = LinearLayout(context).apply { background = bg(p.line, 6f); clipToOutline = true }
+                bar.addView(View(context).apply { setBackgroundColor(p.ok) }, LinearLayout.LayoutParams(0, -1, done.toFloat()))
+                bar.addView(View(context), LinearLayout.LayoutParams(0, -1, (ds.size - done).toFloat()))
+                addView(bar, lp(-1, dp(8), 0, 8, 0, 2))
+            }
+        }
+        Core.meds(this).filter { it.optInt("stock", -1) in 0..5 }.forEach { m ->
+            addCard(p.bad) {
+                addView(tx("Refill soon", 12f, p.bad, bold = true))
+                addView(tx("${m.getString("name")} · ${m.getInt("stock")} left", 16f, p.ink, serif = true))
+            }
+        }
+        val nowS = "%02d:%02d".format(now.get(Calendar.HOUR_OF_DAY), now.get(Calendar.MINUTE))
+        val nextIdx = ds.indices.firstOrNull { stat[it] == null && ds[it].second >= nowS }
+            ?: ds.indices.firstOrNull { stat[it] == null } ?: -1
+        ds.forEachIndexed { i, (m, t) ->
+            val id = m.getString("id"); val st = stat[i]; val col = medColor(id); val isNext = i == nextIdx
+            addCard(col, isNext) {
+                val top = LinearLayout(context).apply { gravity = Gravity.CENTER_VERTICAL }
+                top.addView(tx(t, 24f, p.time, bold = true, serif = true))
+                top.addView(View(context), LinearLayout.LayoutParams(0, 1, 1f))
+                if (st == "taken") top.addView(chip("✓ Taken", p.ok))
+                else if (st == "skipped") top.addView(chip("Skipped", p.bad))
+                else if (isNext) top.addView(chip("Next dose", p.gold))
+                addView(top)
+                addView(tx(m.getString("name"), 20f, p.ink, bold = true, serif = true))
+                if (m.optString("dose") != "") addView(tx(m.optString("dose"), 15f, col, bold = true))
+                if (m.optString("notes") != "") addView(tx(m.optString("notes"), 14f, p.mut, italic = true, serif = true))
+                val chips = LinearLayout(context)
+                chips.addView(chip("Take ${m.optInt("per", 1)}", p.gold), lp(-2, -2, 0, 6, 6, 0))
+                val sk = m.optInt("stock", -1)
+                if (sk >= 0) chips.addView(chip("Stock $sk", if (sk <= 5) p.bad else p.ok), lp(-2, -2, 0, 6, 0, 0))
+                addView(chips)
+                val r = LinearLayout(context)
+                if (st == null) {
+                    r.addView(btn("Taken", p.ok, p.onAcc) { Core.mark(this@MainActivity, id, t, "taken"); show() }, lp(-2, -2, 0, 10, 8, 0))
+                    r.addView(btn("Skip", p.bad, p.bad, true) { Core.mark(this@MainActivity, id, t, "skipped"); show() }, lp(-2, -2, 0, 10, 0, 0))
+                } else {
+                    r.addView(btn("Undo", p.mut, p.mut, true) { Core.mark(this@MainActivity, id, t, ""); show() }, lp(-2, -2, 0, 10, 0, 0))
+                }
+                addView(r)
+            }
+        }
+    }
+
+    // ---------- Remedies ----------
+    private fun medsList() {
+        heading("Remedies", "Your medicine shelf")
+        box.addView(btn("+ Add remedy", p.gold, p.onAcc) {
+            editing = JSONObject().put("id", "m" + System.currentTimeMillis()).put("name", "").put("dose", "").put("per", 1)
+                .put("times", JSONArray().put("08:00")).put("days", JSONArray(listOf(1, 2, 3, 4, 5, 6, 7)))
+                .put("end", "").put("stock", -1).put("notes", "").put("isNew", true)
+            scroll.scrollTo(0, 0); show()
+        }, lp(-2, -2, 0, 4, 0, 8))
+        val l = Core.meds(this)
+        if (l.isEmpty()) addCard(p.gold) { addView(tx("The shelf is empty. Add a remedy by hand or with Ask AI.", 14f, p.mut)) }
+        l.forEach { m ->
+            val col = medColor(m.getString("id"))
+            addCard(col) {
+                addView(tx(m.getString("name"), 20f, p.ink, bold = true, serif = true))
+                if (m.optString("dose") != "") addView(tx(m.optString("dose"), 15f, col, bold = true))
+                addView(tx(describe(m), 14f, p.time))
+                if (m.optString("end") != "") addView(tx("Until " + m.optString("end"), 13f, p.mut, italic = true, serif = true))
+                if (m.optString("notes") != "") addView(tx(m.optString("notes"), 14f, p.mut, italic = true, serif = true))
+                val sk = m.optInt("stock", -1)
+                if (sk >= 0) addView(chip("Stock $sk", if (sk <= 5) p.bad else p.ok), lp(-2, -2, 0, 6, 0, 0))
+                addView(btn("Edit", p.gold, p.gold, true) { editing = m; scroll.scrollTo(0, 0); show() }, lp(-2, -2, 0, 10, 0, 0))
+            }
+        }
+    }
+
+    private fun form(m: JSONObject) {
+        val isNew = m.optBoolean("isNew")
+        heading(if (isNew) "New remedy" else "Edit remedy", "Fill in the details")
+        val name = field("Name", m.getString("name")); val dose = field("Dose (e.g. 500 mg)", m.optString("dose"))
+        val per = field("Units per dose", m.optInt("per", 1).toString())
+        val times = field("Times, comma separated (08:00,20:00)", Core.strs(m.getJSONArray("times")).joinToString(","))
+        val end = field("Last day yyyy-mm-dd (optional)", m.optString("end"))
+        val stock = field("Stock in units (optional)", if (m.optInt("stock", -1) >= 0) m.getInt("stock").toString() else "")
+        val notes = field("Notes (e.g. after food)", m.optString("notes"))
+        val dn = listOf("Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat")
+        val cur = Core.ints(m.getJSONArray("days"))
+        val cbs = dn.mapIndexed { i, n ->
+            CheckBox(this).apply { text = n; isChecked = (i + 1) in cur; textSize = 10f; setTextColor(p.ink); buttonTintList = ColorStateList.valueOf(p.gold) }
+        }
+        val dayRow = LinearLayout(this)
+        cbs.forEach { dayRow.addView(it, LinearLayout.LayoutParams(0, -2, 1f)) }
+        addCard(p.gold) {
+            for (v in listOf<View>(name, dose, per, times, end, stock, notes)) addView(v, lp(-1, -2, 0, 6, 0, 0))
+            addView(tx("Days", 13f, p.mut, italic = true, serif = true), lp(-2, -2, 0, 10, 0, 0))
+            addView(dayRow)
+            val r = LinearLayout(context)
+            r.addView(btn("Save", p.gold, p.onAcc) {
+                val ts = times.text.toString().split(",").map { it.trim() }.filter { Regex("\\d{1,2}:\\d{2}").matches(it) }
+                    .map { it.padStart(5, '0') }.sorted()
+                val ds = cbs.indices.filter { cbs[it].isChecked }.map { it + 1 }
+                if (name.text.isBlank() || ts.isEmpty() || ds.isEmpty()) {
+                    toast("Need a name, a time like 08:00, and at least one day")
+                } else {
+                    val o = JSONObject().put("id", m.getString("id")).put("name", name.text.toString().trim())
+                        .put("dose", dose.text.toString()).put("per", per.text.toString().toIntOrNull() ?: 1)
+                        .put("times", JSONArray(ts)).put("days", JSONArray(ds)).put("end", end.text.toString().trim())
+                        .put("stock", stock.text.toString().toIntOrNull() ?: -1).put("notes", notes.text.toString())
+                    Core.upsert(this@MainActivity, o); editing = null; show()
+                }
+            }, lp(-2, -2, 0, 12, 8, 0))
+            r.addView(btn("Cancel", p.mut, p.mut, true) { editing = null; show() }, lp(-2, -2, 0, 12, 0, 0))
+            addView(r)
+            if (!isNew) addView(btn("Delete remedy", p.bad, p.bad, true) {
+                Core.delete(this@MainActivity, m.getString("id")); editing = null; show()
+            }, lp(-2, -2, 0, 10, 0, 0))
+        }
+    }
+
+    // ---------- Ask AI ----------
+    private fun aiTab() {
+        heading("Ask AI", "Describe it, and the scribe fills the schedule")
+        val q = field("e.g. Metformin 500mg after breakfast and dinner for 30 days, 60 tablets", aiText, 4)
+        addCard(p.gold) {
+            addView(tx("You can also paste text from a prescription.", 14f, p.mut, italic = true, serif = true))
+            addView(q, lp(-1, -2, 0, 8, 0, 0))
+            addView(btn("Create with AI", p.gold, p.onAcc) { runAI(q.text.toString()) }, lp(-2, -2, 0, 10, 0, 0))
+            if (aiMsg != "") addView(tx(aiMsg, 14f, p.time, italic = true, serif = true), lp(-2, -2, 0, 8, 0, 0))
+        }
+        ai.forEach { m ->
+            val col = medColor(m.getString("id"))
+            addCard(col) {
+                addView(tx(m.getString("name"), 18f, p.ink, bold = true, serif = true))
+                if (m.optString("dose") != "") addView(tx(m.optString("dose"), 15f, col, bold = true))
+                addView(tx(describe(m), 14f, p.time))
+                if (m.optString("end") != "") addView(tx("Until " + m.optString("end"), 13f, p.mut, italic = true, serif = true))
+                if (m.optInt("stock", -1) >= 0) addView(tx("Stock " + m.getInt("stock"), 13f, p.ok))
+                if (m.optString("notes") != "") addView(tx(m.optString("notes"), 14f, p.mut, italic = true, serif = true))
+            }
+        }
+        if (ai.isNotEmpty()) {
+            val r = LinearLayout(this)
+            r.addView(btn("Save all ${ai.size}", p.ok, p.onAcc) {
+                ai.forEach { Core.upsert(this, it) }; ai = emptyList(); aiMsg = "Saved."; aiText = ""; tab = 0; show()
+            }, lp(-2, -2, 0, 6, 8, 0))
+            r.addView(btn("Discard", p.mut, p.mut, true) { ai = emptyList(); aiMsg = ""; show() }, lp(-2, -2, 0, 6, 0, 0))
+            box.addView(r)
+        }
+    }
+
+    private fun runAI(q: String) {
+        aiText = q
+        val key = Core.sp(this).getString("key", "") ?: ""
+        val model = Core.sp(this).getString("model", "gemini-3.5-flash-lite") ?: "gemini-3.5-flash-lite"
+        if (key.isEmpty()) { aiMsg = "Add your Gemini API key in Settings first."; show(); return }
+        if (q.isBlank()) return
+        aiMsg = "Consulting the scribe..."; show()
+        thread {
+            try {
+                val r = Core.ask(key, model, q)
+                runOnUiThread { ai = r; aiMsg = if (r.isEmpty()) "No medicines found." else "Check the result, then save."; show() }
+            } catch (e: Exception) {
+                runOnUiThread { ai = emptyList(); aiMsg = "Error: " + e.message; show() }
+            }
+        }
+    }
+
+    // ---------- Settings ----------
+    private fun settings() {
+        val sp = Core.sp(this)
+        heading("Settings", "Make the app your own")
+        val cur = sp.getString("theme", "system") ?: "system"
+        addCard(p.gold) {
+            addView(tx("Appearance", 18f, p.ink, bold = true, serif = true))
+            val r = LinearLayout(context)
+            listOf("system" to "System", "light" to "Light", "dark" to "Dark").forEach { (k, n) ->
+                r.addView(
+                    if (cur == k) btn(n, p.gold, p.onAcc) {} else btn(n, p.mut, p.mut, true) {
+                        sp.edit().putString("theme", k).apply(); recreate()
+                    }, lp(-2, -2, 0, 8, 8, 0)
+                )
+            }
+            addView(r)
+        }
+        val key = field("AIza...", sp.getString("key", "") ?: "")
+        val model = field("Model", sp.getString("model", "gemini-3.5-flash-lite") ?: "gemini-3.5-flash-lite")
+        addCard(p.time) {
+            addView(tx("Gemini API", 18f, p.ink, bold = true, serif = true))
+            addView(tx("Key from aistudio.google.com", 13f, p.mut, italic = true, serif = true))
+            addView(key, lp(-1, -2, 0, 6, 0, 0)); addView(model, lp(-1, -2, 0, 6, 0, 0))
+            addView(btn("Save", p.gold, p.onAcc) {
+                sp.edit().putString("key", key.text.toString().trim())
+                    .putString("model", model.text.toString().trim().ifEmpty { "gemini-3.5-flash-lite" }).apply()
+                toast("Saved")
+            }, lp(-2, -2, 0, 10, 0, 0))
+        }
+        addCard(p.ok) {
+            addView(tx("Reminders", 18f, p.ink, bold = true, serif = true))
+            if (Build.VERSION.SDK_INT in 31..32) addView(btn("Allow exact alarms", p.gold, p.gold, true) {
+                startActivity(Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM, Uri.parse("package:$packageName")))
+            }, lp(-2, -2, 0, 8, 0, 0))
+            addView(btn("Test notification", p.gold, p.gold, true) {
+                Core.meds(this@MainActivity).firstOrNull()?.let { Core.notify(this@MainActivity, it, Core.strs(it.getJSONArray("times")).first()) }
+                    ?: toast("Add a remedy first")
+            }, lp(-2, -2, 0, 8, 0, 0))
+        }
+        addCard(p.bad) {
+            addView(tx("Backup", 18f, p.ink, bold = true, serif = true))
+            addView(tx("Saves your remedies and history to a file. Your API key is not included.", 13f, p.mut, italic = true, serif = true))
+            val r = LinearLayout(context)
+            r.addView(btn("Export", p.gold, p.onAcc) { exportBackup() }, lp(-2, -2, 0, 10, 8, 0))
+            r.addView(btn("Import", p.gold, p.gold, true) { importBackup() }, lp(-2, -2, 0, 10, 0, 0))
+            addView(r)
+        }
+    }
+
+    // ---------- Backup ----------
+    private fun exportBackup() {
+        val name = "pillpal-backup-" + Core.ymd(Calendar.getInstance()) + ".json"
+        startActivityForResult(
+            Intent(Intent.ACTION_CREATE_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE)
+                .setType("application/json").putExtra(Intent.EXTRA_TITLE, name), 101
+        )
+    }
+    private fun importBackup() {
+        startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*"), 102)
+    }
+    @Suppress("DEPRECATION")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        val uri = data?.data ?: return
+        if (resultCode != RESULT_OK) return
+        try {
+            if (requestCode == 101) {
+                contentResolver.openOutputStream(uri)?.use { it.write(Core.exportJson(this).toByteArray()) }
+                toast("Backup saved")
+            } else if (requestCode == 102) {
+                val txt = contentResolver.openInputStream(uri)?.bufferedReader()?.readText() ?: ""
+                AlertDialog.Builder(this).setTitle("Import backup?")
+                    .setMessage("This replaces your current remedies and history.")
+                    .setPositiveButton("Import") { _, _ ->
+                        try { val n = Core.importJson(this, txt); toast("Imported $n remedies"); show() }
+                        catch (e: Exception) { toast("Not a valid backup: " + e.message) }
+                    }
+                    .setNegativeButton("Cancel", null).show()
+            }
+        } catch (e: Exception) { toast("Failed: " + e.message) }
+    }
+}
