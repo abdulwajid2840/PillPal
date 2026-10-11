@@ -28,6 +28,9 @@ import android.text.Editable
 import android.text.TextWatcher
 import android.text.method.PasswordTransformationMethod
 import android.widget.ImageView
+import android.widget.HorizontalScrollView
+import android.app.TimePickerDialog
+import android.app.DatePickerDialog
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.Date
@@ -181,6 +184,52 @@ object Core {
         }
     }
 
+    fun fmt12(s: String): String {
+        if (!validHm(s)) return s
+        val mins = hm(s)
+        val h = mins / 60
+        val mi = mins % 60
+        val ap = if (h < 12) "AM" else "PM"
+        val h12 = if (h % 12 == 0) 12 else h % 12
+        return "%d:%02d %s".format(h12, mi, ap)
+    }
+    fun weekStats(c: Context): List<Triple<String, Int, Int>> {
+        val lg = JSONObject(sp(c).getString("log", "{}"))
+        val ms = meds(c).filter { mode(it) == "times" }
+        val dn = listOf("S", "M", "T", "W", "T", "F", "S")
+        return (6 downTo 0).map { back ->
+            val cal = Calendar.getInstance()
+            cal.add(Calendar.DAY_OF_YEAR, -back)
+            val day = ymd(cal)
+            var total = 0
+            var taken = 0
+            ms.forEach { m ->
+                if (activeOn(m, cal)) {
+                    strs(m.getJSONArray("times")).forEach { t ->
+                        total++
+                        if (lg.optString(day + "|" + m.getString("id") + "|" + t) == "taken") taken++
+                    }
+                }
+            }
+            Triple(dn[cal.get(Calendar.DAY_OF_WEEK) - 1], taken, total)
+        }
+    }
+    fun snooze(c: Context, id: String, t: String, minutes: Int = 10) {
+        val am = c.getSystemService(AlarmManager::class.java)
+        val p = PendingIntent.getBroadcast(
+            c, 0,
+            Intent(c, AlarmReceiver::class.java).setData(Uri.parse("pp://snooze/$id/$t"))
+                .putExtra("id", id).putExtra("t", t).putExtra("snooze", true),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val at = System.currentTimeMillis() + minutes * 60000L
+        if (Build.VERSION.SDK_INT < 31 || am.canScheduleExactAlarms()) {
+            am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, p)
+        } else {
+            am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, p)
+        }
+    }
+
     // ---- when is a medicine active on a day ----
     fun activeOn(m: JSONObject, cal: Calendar): Boolean {
         val day = ymd(cal)
@@ -297,7 +346,7 @@ object Core {
             .setContentTitle("Time for " + m.getString("name"))
             .setContentText((m.optString("dose") + " " + extra + low).trim())
             .setAutoCancel(true).setContentIntent(open)
-            .addAction(act("taken", "Taken")).addAction(act("skipped", "Skip"))
+            .addAction(act("taken", "Taken")).addAction(act("skipped", "Skip")).addAction(act("snooze", "Snooze 10 min"))
             .build()
         c.getSystemService(NotificationManager::class.java).notify(nid, n)
     }
@@ -392,6 +441,10 @@ class AlarmReceiver : BroadcastReceiver() {
         val id = i.getStringExtra("id") ?: return
         val t = i.getStringExtra("t") ?: return
         val m = Core.med(c, id) ?: return
+        if (i.getBooleanExtra("snooze", false)) {
+            Core.notify(c, m, t)
+            return
+        }
         val md = Core.mode(m)
         if (t == "~") {
             if (md != "interval") return
@@ -404,7 +457,14 @@ class AlarmReceiver : BroadcastReceiver() {
 }
 class ActionReceiver : BroadcastReceiver() {
     override fun onReceive(c: Context, i: Intent) {
-        Core.mark(c, i.getStringExtra("id") ?: return, i.getStringExtra("t") ?: return, i.getStringExtra("st") ?: return)
+        val id = i.getStringExtra("id") ?: return
+        val t = i.getStringExtra("t") ?: return
+        val st = i.getStringExtra("st") ?: return
+        if (st == "snooze") {
+            Core.snooze(c, id, t)
+        } else {
+            Core.mark(c, id, t, st)
+        }
         c.getSystemService(NotificationManager::class.java).cancel(i.getIntExtra("n", 0))
     }
 }
@@ -459,6 +519,53 @@ class MainActivity : Activity() {
     }
     private val medLight = listOf("#B5483A", "#3D5A80", "#4F7A5A", "#C98B2B", "#8C4A6B", "#7A5C3E")
     private val medDark = listOf("#E07A68", "#86A8D4", "#80B68E", "#E6B456", "#CC8FB0", "#BE9A78")
+    private fun colorFor(m: JSONObject): Int {
+        val ci = m.optInt("color", -1)
+        return if (ci in 0..5) c((if (p.dark) medDark else medLight)[ci]) else medColor(m.getString("id"))
+    }
+
+    private fun weekCard() {
+        val st = Core.weekStats(this)
+        if (st.all { it.third == 0 }) return
+        var streak = 0
+        for (k in st.indices.reversed()) {
+            val tk = st[k].second
+            val tt = st[k].third
+            if (tt == 0) continue
+            if (tk == tt) {
+                streak++
+            } else if (k == st.size - 1) {
+                continue
+            } else {
+                break
+            }
+        }
+        addCard(p.time) {
+            val hdr = LinearLayout(context)
+            hdr.gravity = Gravity.CENTER_VERTICAL
+            hdr.addView(tx("This week", 15f, p.ink, bold = true, serif = true), LinearLayout.LayoutParams(0, -2, 1f))
+            if (streak > 0) hdr.addView(chip("$streak-day streak", p.ok))
+            addView(hdr)
+            val row = LinearLayout(context)
+            st.forEachIndexed { k, d ->
+                val tk = d.second
+                val tt = d.third
+                val colr = if (tt == 0) p.line else if (tk == tt) p.ok else if (tk > 0) p.gold else if (k == st.size - 1) p.line else p.bad
+                val colm = LinearLayout(context)
+                colm.orientation = LinearLayout.VERTICAL
+                colm.gravity = Gravity.CENTER_HORIZONTAL
+                val dot = tx(if (tt == 0) "–" else "$tk/$tt", 10f, if (tt == 0) p.mut else p.onAcc, bold = true)
+                dot.gravity = Gravity.CENTER
+                dot.setPadding(0, 0, 0, 0)
+                dot.background = bg(colr, 18f)
+                colm.addView(dot, LinearLayout.LayoutParams(dp(36), dp(36)))
+                colm.addView(tx(d.first, 11f, p.mut), lp(-2, -2, 0, 4, 0, 0))
+                row.addView(colm, lp(0, -2).apply { weight = 1f })
+            }
+            addView(row, lp(-1, -2, 0, 8, 0, 0))
+        }
+    }
+
     private fun medColor(id: String) = c((if (p.dark) medDark else medLight)[(id.hashCode() and 0x7fffffff) % 6])
 
     // ---------- view helpers ----------
@@ -533,9 +640,9 @@ class MainActivity : Activity() {
             return "As needed"
         }
         val head = if (md == "interval") {
-            "Every " + Core.fmtInterval(m.optInt("intervalMin", 0)) + " · " + m.optString("winStart", "00:00") + "–" + m.optString("winEnd", "23:59")
+            "Every " + Core.fmtInterval(m.optInt("intervalMin", 0)) + " · " + Core.fmt12(m.optString("winStart", "00:00")) + " – " + Core.fmt12(m.optString("winEnd", "23:59"))
         } else {
-            Core.strs(m.getJSONArray("times")).joinToString(", ")
+            Core.strs(m.getJSONArray("times")).joinToString(", ") { Core.fmt12(it) }
         }
         var s = head + " · " + (if (d.size == 7) "every day" else d.joinToString(" ") { dn[it - 1] })
         val ev = m.optInt("every", 1)
@@ -716,7 +823,7 @@ class MainActivity : Activity() {
         val stat = ds.map { Core.getLog(this, Core.key(it.first.getString("id"), it.second)) }
         val done = stat.count { it != null }
         val filtering = q.isNotBlank()
-        val idx = ds.indices.filter { hit(ds[it].first, ds[it].second + " " + (stat[it] ?: "pending"), q) }
+        val idx = ds.indices.filter { hit(ds[it].first, ds[it].second + " " + Core.fmt12(ds[it].second) + " " + (stat[it] ?: "pending"), q) }
         val rep = rep0.filter { hit(it, if (Core.mode(it) == "interval") "repeating" else "as needed", q) }
         if (ds.isEmpty() && rep0.isEmpty()) {
             addCard(p.gold) {
@@ -737,6 +844,7 @@ class MainActivity : Activity() {
                 addView(bar, lp(-1, dp(8), 0, 8, 0, 2))
             }
         }
+        if (!filtering) weekCard()
         if (!filtering) {
             Core.meds(this).filter { it.optInt("stock", -1) in 0..5 }.forEach { m ->
                 addCard(p.bad) {
@@ -753,11 +861,11 @@ class MainActivity : Activity() {
             val t = ds[i].second
             val id = m.getString("id")
             val st = stat[i]
-            val col = medColor(id)
+            val col = colorFor(m)
             val isNext = i == nextIdx
             addCard(col, isNext) {
                 val top = LinearLayout(context).apply { gravity = Gravity.CENTER_VERTICAL }
-                top.addView(tx(t, 24f, p.time, bold = true, serif = true))
+                top.addView(tx(Core.fmt12(t), 24f, p.time, bold = true, serif = true))
                 top.addView(View(context), LinearLayout.LayoutParams(0, 1, 1f))
                 if (st == "taken") {
                     top.addView(chip("✓ Taken", p.ok))
@@ -787,7 +895,7 @@ class MainActivity : Activity() {
         }
         rep.forEach { m ->
             val id = m.getString("id")
-            val col = medColor(id)
+            val col = colorFor(m)
             val n = Core.count(this, id)
             val isIv = Core.mode(m) == "interval"
             addCard(col) {
@@ -801,7 +909,7 @@ class MainActivity : Activity() {
                 addView(tx(describe(m), 14f, p.time))
                 if (isIv) {
                     val nx = Core.nextInterval(m)
-                    val label = if (nx == null) "No more reminders" else "Next reminder " + SimpleDateFormat("EEE HH:mm", Locale.getDefault()).format(Date(nx))
+                    val label = if (nx == null) "No more reminders" else "Next reminder " + SimpleDateFormat("EEE h:mm a", Locale.getDefault()).format(Date(nx))
                     addView(tx(label, 13f, p.mut, italic = true, serif = true))
                 }
                 if (m.optString("notes") != "") addView(tx(m.optString("notes"), 14f, p.mut, italic = true, serif = true))
@@ -820,7 +928,7 @@ class MainActivity : Activity() {
         .put("mode", "times").put("times", JSONArray().put("08:00")).put("intervalMin", 0)
         .put("winStart", "00:00").put("winEnd", "23:59")
         .put("days", JSONArray(listOf(1, 2, 3, 4, 5, 6, 7))).put("every", 1).put("cycleOn", 0).put("cycleOff", 0)
-        .put("start", Core.ymd(Calendar.getInstance())).put("end", "").put("stock", -1).put("notes", "").put("isNew", true)
+        .put("start", Core.ymd(Calendar.getInstance())).put("end", "").put("stock", -1).put("notes", "").put("color", Core.meds(this).size % 6).put("isNew", true)
 
     private fun medsList() {
         heading("Medicines", "Your medicine shelf")
@@ -832,7 +940,7 @@ class MainActivity : Activity() {
         val l = Core.meds(this)
         if (l.isEmpty()) addCard(p.gold) { addView(tx("The shelf is empty. Add a medicine by hand or with Ask AI.", 14f, p.mut)) }
         l.forEach { m ->
-            val col = medColor(m.getString("id"))
+            val col = colorFor(m)
             addCard(col) {
                 addView(tx(m.getString("name"), 20f, p.ink, bold = true, serif = true))
                 if (m.optString("dose") != "") addView(tx(m.optString("dose"), 15f, col, bold = true))
@@ -848,73 +956,185 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun lab(s: String) = tx(s, 12f, p.mut, bold = true).apply { setPadding(0, dp(12), 0, dp(3)) }
+    private fun pill(label: String, on: Boolean, f: () -> Unit): TextView {
+        val t = tx(label, 13f, if (on) p.onAcc else p.gold, bold = true, serif = true)
+        t.gravity = Gravity.CENTER
+        t.setPadding(dp(14), dp(8), dp(14), dp(8))
+        t.background = if (on) bg(p.gold, 18f) else bg(Color.TRANSPARENT, 18f, p.gold, 1)
+        t.setOnClickListener { f() }
+        return t
+    }
+    private fun hrow(vararg v: View): HorizontalScrollView {
+        val hs = HorizontalScrollView(this)
+        hs.isHorizontalScrollBarEnabled = false
+        val r = LinearLayout(this)
+        for (x in v) r.addView(x, lp(-2, -2, 0, 0, 8, 0))
+        hs.addView(r)
+        return hs
+    }
+    private fun pickTime(initial: String?, onDone: (String) -> Unit) {
+        val mins = if (initial != null && Core.validHm(initial)) Core.hm(initial) else 8 * 60
+        TimePickerDialog(this, { _, hh, mm -> onDone("%02d:%02d".format(hh, mm)) }, mins / 60, mins % 60, false).show()
+    }
+    private fun pickDate(initial: String, onDone: (String) -> Unit) {
+        val cal = Calendar.getInstance()
+        runCatching {
+            val d = LocalDate.parse(initial)
+            cal.set(d.year, d.monthValue - 1, d.dayOfMonth)
+        }
+        DatePickerDialog(
+            this, { _, y, mo, d -> onDone("%04d-%02d-%02d".format(y, mo + 1, d)) },
+            cal.get(Calendar.YEAR), cal.get(Calendar.MONTH), cal.get(Calendar.DAY_OF_MONTH)
+        ).show()
+    }
+    private fun fmtDate(s: String): String {
+        if (s.isBlank()) return "Not set"
+        return runCatching {
+            SimpleDateFormat("EEE, d MMM yyyy", Locale.getDefault()).format(SimpleDateFormat("yyyy-MM-dd", Locale.US).parse(s)!!)
+        }.getOrDefault(s)
+    }
+    private fun setTimes(m: JSONObject, l: List<String>) {
+        m.put("times", JSONArray(l.distinct().sorted()))
+    }
+
     private fun form(m: JSONObject) {
         val isNew = m.optBoolean("isNew")
         val mode = Core.mode(m)
         heading(if (isNew) "New medicine" else "Edit medicine", "Fill in the details")
-        val name = field("Name", m.getString("name"))
-        val dose = field("Dose (e.g. 500 mg)", m.optString("dose"))
-        val per = field("Units per dose", m.optInt("per", 1).toString())
-        val times = field("Times, comma separated (08:00,20:00)", Core.strs(m.getJSONArray("times")).joinToString(","))
-        val ival = field("Repeat every (e.g. 5m, 30m, 8h)", Core.shortInterval(m.optInt("intervalMin", 0)))
-        val ws = field("From (HH:MM)", m.optString("winStart", "00:00"))
-        val we = field("Until (HH:MM)", m.optString("winEnd", "23:59"))
-        val every = field("Repeat every N days (1 = daily)", m.optInt("every", 1).toString())
-        val con = field("Cycle: days on (optional)", if (m.optInt("cycleOn", 0) > 0) m.optInt("cycleOn").toString() else "")
-        val coff = field("Cycle: days off (optional)", if (m.optInt("cycleOff", 0) > 0) m.optInt("cycleOff").toString() else "")
-        val start = field("Start date yyyy-mm-dd", m.optString("start"))
-        val end = field("Last day yyyy-mm-dd (optional)", m.optString("end"))
-        val stock = field("Stock in units (optional)", if (m.optInt("stock", -1) >= 0) m.getInt("stock").toString() else "")
-        val notes = field("Notes (e.g. after food)", m.optString("notes"))
-        val dn = listOf("Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat")
-        val cur = Core.ints(m.getJSONArray("days"))
-        val cbs = dn.mapIndexed { i, n ->
-            CheckBox(this).apply {
-                text = n
-                isChecked = (i + 1) in cur
-                textSize = 10f
-                setTextColor(p.ink)
-                buttonTintList = ColorStateList.valueOf(p.gold)
-            }
-        }
-        val dayRow = LinearLayout(this)
-        cbs.forEach { dayRow.addView(it, LinearLayout.LayoutParams(0, -2, 1f)) }
+        val name = field("e.g. Metformin", m.getString("name"))
+        val dose = field("e.g. 500 mg", m.optString("dose"))
+        val per = field("1", m.optInt("per", 1).toString())
+        val ival = field("e.g. 5m, 30m, 8h", Core.shortInterval(m.optInt("intervalMin", 0)))
+        val every = field("1", m.optInt("every", 1).toString())
+        val con = field("On", if (m.optInt("cycleOn", 0) > 0) m.optInt("cycleOn").toString() else "")
+        val coff = field("Off", if (m.optInt("cycleOff", 0) > 0) m.optInt("cycleOff").toString() else "")
+        val stock = field("Optional", if (m.optInt("stock", -1) >= 0) m.getInt("stock").toString() else "")
+        val notes = field("e.g. after food", m.optString("notes"))
 
         fun collect() {
             m.put("name", name.text.toString().trim())
             m.put("dose", dose.text.toString())
             m.put("per", per.text.toString().toIntOrNull() ?: 1)
-            val ts = times.text.toString().split(",").map { it.trim() }.filter { Core.validHm(it) }.map { it.padStart(5, '0') }.sorted()
-            m.put("times", JSONArray(ts))
             m.put("intervalMin", Core.parseInterval(ival.text.toString()))
-            m.put("winStart", ws.text.toString().trim())
-            m.put("winEnd", we.text.toString().trim())
-            m.put("days", JSONArray(cbs.indices.filter { cbs[it].isChecked }.map { it + 1 }))
             m.put("every", every.text.toString().toIntOrNull() ?: 1)
             m.put("cycleOn", con.text.toString().toIntOrNull() ?: 0)
             m.put("cycleOff", coff.text.toString().toIntOrNull() ?: 0)
-            m.put("start", start.text.toString().trim())
-            m.put("end", end.text.toString().trim())
             m.put("stock", stock.text.toString().toIntOrNull() ?: -1)
             m.put("notes", notes.text.toString())
+        }
+        fun redo(f: () -> Unit) {
+            collect()
+            f()
+            show()
         }
         fun validate(): String? {
             val md = Core.mode(m)
             if (m.getString("name").isBlank()) return "Enter a name"
             if (md != "asneeded" && m.getJSONArray("days").length() == 0) return "Pick at least one day"
-            if (md == "times" && m.getJSONArray("times").length() == 0) return "Add at least one time like 08:00"
-            if (md == "interval") {
-                if (m.optInt("intervalMin", 0) < 1) return "Enter how often, like 5m or 8h"
-                val a = m.optString("winStart")
-                val b = m.optString("winEnd")
-                if (!Core.validHm(a) || !Core.validHm(b)) return "From and Until must look like 08:00"
-                if (Core.hm(a) > Core.hm(b)) return "Until must be later than From"
+            if (md == "times" && m.getJSONArray("times").length() == 0) return "Add at least one time"
+            if (md == "interval" && m.optInt("intervalMin", 0) < 1) return "Enter how often, like 5m or 8h"
+            if (md == "interval" && Core.hm(m.optString("winStart", "00:00")) > Core.hm(m.optString("winEnd", "23:59"))) {
+                return "Until must be later than From"
             }
-            for (d in listOf(m.optString("start"), m.optString("end"))) {
-                if (d != "" && !Regex("[0-9]{4}-[0-9]{2}-[0-9]{2}").matches(d)) return "Dates look like 2026-10-31"
-            }
+            val s = m.optString("start")
+            val e = m.optString("end")
+            if (s != "" && e != "" && e < s) return "The last day is before the start date"
             return null
         }
+
+        // colour picker
+        val ci = m.optInt("color", -1).let { if (it in 0..5) it else (m.getString("id").hashCode() and 0x7fffffff) % 6 }
+        val colorRow = LinearLayout(this)
+        for (k in 0..5) {
+            val cc = c((if (p.dark) medDark else medLight)[k])
+            val dotv = View(this)
+            dotv.background = if (k == ci) bg(cc, 20f, p.ink, 3) else bg(cc, 20f)
+            dotv.setOnClickListener { redo { m.put("color", k) } }
+            colorRow.addView(dotv, lp(dp(32), dp(32), 0, 0, 10, 0))
+        }
+
+        // days
+        val dn2 = listOf("Su", "Mo", "Tu", "We", "Th", "Fr", "Sa")
+        val cur = Core.ints(m.getJSONArray("days"))
+        val dayRow = LinearLayout(this)
+        for (i in 0..6) {
+            val on = (i + 1) in cur
+            val t = tx(dn2[i], 12f, if (on) p.onAcc else p.mut, bold = true)
+            t.gravity = Gravity.CENTER
+            t.setPadding(0, dp(11), 0, dp(11))
+            t.background = if (on) bg(p.gold, 20f) else bg(Color.TRANSPARENT, 20f, p.line, 1)
+            t.setOnClickListener {
+                redo {
+                    val set = Core.ints(m.getJSONArray("days")).toMutableSet()
+                    if (!set.add(i + 1)) set.remove(i + 1)
+                    m.put("days", JSONArray(set.sorted()))
+                }
+            }
+            dayRow.addView(t, lp(0, -2, 2, 0, 2, 0).apply { weight = 1f })
+        }
+        fun setDays(l: List<Int>) = redo { m.put("days", JSONArray(l)) }
+
+        // fixed times
+        val tl = Core.strs(m.getJSONArray("times"))
+        val timeRows = LinearLayout(this)
+        timeRows.orientation = LinearLayout.VERTICAL
+        tl.forEachIndexed { idx, t ->
+            val row = LinearLayout(this)
+            row.gravity = Gravity.CENTER_VERTICAL
+            row.addView(btn(Core.fmt12(t), p.gold, p.gold, true) {
+                collect()
+                pickTime(t) { nt ->
+                    val l = tl.toMutableList()
+                    l[idx] = nt
+                    setTimes(m, l)
+                    show()
+                }
+            }, lp(0, -2, 0, 4, 8, 0).apply { weight = 1f })
+            if (tl.size > 1) {
+                row.addView(btn("✕", p.bad, p.bad, true) {
+                    redo {
+                        val l = tl.toMutableList()
+                        l.removeAt(idx)
+                        setTimes(m, l)
+                    }
+                }, lp(-2, -2, 0, 4, 0, 0))
+            }
+            timeRows.addView(row)
+        }
+        val presets = hrow(
+            pill("Once daily", false) { redo { setTimes(m, listOf("08:00")) } },
+            pill("Twice daily", false) { redo { setTimes(m, listOf("08:00", "20:00")) } },
+            pill("3 times", false) { redo { setTimes(m, listOf("08:00", "14:00", "20:00")) } },
+            pill("4 times", false) { redo { setTimes(m, listOf("08:00", "12:00", "16:00", "20:00")) } }
+        )
+        val ivPills = hrow(*listOf(5, 15, 30, 60, 120, 240, 360, 480, 720).map { v ->
+            pill(Core.shortInterval(v), m.optInt("intervalMin", 0) == v) { redo { m.put("intervalMin", v) } } as View
+        }.toTypedArray())
+
+        // duration
+        val start = m.optString("start")
+        val end = m.optString("end")
+        fun endFor(n: Int): String {
+            val s = if (start.isBlank()) Core.ymd(Calendar.getInstance()) else start
+            return LocalDate.parse(s).plusDays((n - 1).toLong()).toString()
+        }
+        val durPills = hrow(*(listOf(3, 5, 7, 14, 30).map { n ->
+            pill("$n days", end == endFor(n)) {
+                redo {
+                    if (start.isBlank()) m.put("start", Core.ymd(Calendar.getInstance()))
+                    m.put("end", endFor(n))
+                }
+            } as View
+        } + (pill("Ongoing", end == "") { redo { m.put("end", "") } } as View)).toTypedArray())
+        val foodPills = hrow(*listOf("Before food", "After food", "With food", "At bedtime").map { f ->
+            pill(f, false) {
+                redo {
+                    val cn = m.optString("notes")
+                    if (!cn.contains(f)) m.put("notes", if (cn.isBlank()) f else "$cn, $f")
+                }
+            } as View
+        }.toTypedArray())
 
         val modeRow = LinearLayout(this)
         listOf("times" to "Fixed times", "interval" to "Repeating", "asneeded" to "As needed").forEach { (k, n) ->
@@ -928,58 +1148,121 @@ class MainActivity : Activity() {
             modeRow.addView(b, lp(0, -2, 0, 0, 6, 0).apply { weight = 1f })
         }
 
-        addCard(p.gold) {
-            for (v in listOf<View>(name, dose, per)) addView(v, lp(-1, -2, 0, 6, 0, 0))
-            addView(tx("Schedule type", 13f, p.mut, italic = true, serif = true), lp(-2, -2, 0, 10, 0, 0))
-            addView(modeRow, lp(-1, -2, 0, 4, 0, 0))
+        addCard(colorFor(m)) {
+            addView(tx("Medicine", 18f, p.ink, bold = true, serif = true))
+            addView(lab("NAME")); addView(name)
+            addView(lab("DOSE")); addView(dose)
+            addView(lab("UNITS PER DOSE")); addView(per)
+            addView(lab("COLOUR")); addView(colorRow)
+        }
+        addCard(p.time) {
+            addView(tx("Schedule", 18f, p.ink, bold = true, serif = true))
+            addView(modeRow, lp(-1, -2, 0, 8, 0, 0))
             if (mode == "times") {
-                addView(times, lp(-1, -2, 0, 6, 0, 0))
+                addView(lab("QUICK SETUP")); addView(presets)
+                addView(lab("TIMES")); addView(timeRows)
+                addView(btn("+ Add time", p.gold, p.onAcc) {
+                    collect()
+                    pickTime(null) { nt -> setTimes(m, tl + nt); show() }
+                }, lp(-2, -2, 0, 8, 0, 0))
             }
             if (mode == "interval") {
-                addView(ival, lp(-1, -2, 0, 6, 0, 0))
-                addView(tx("Only between these times each day", 13f, p.mut, italic = true, serif = true), lp(-2, -2, 0, 8, 0, 0))
-                addView(ws, lp(-1, -2, 0, 4, 0, 0))
-                addView(we, lp(-1, -2, 0, 6, 0, 0))
+                addView(lab("REPEAT EVERY")); addView(ival); addView(ivPills, lp(-1, -2, 0, 8, 0, 0))
+                addView(lab("ONLY BETWEEN"))
+                val wr = LinearLayout(context)
+                val ws = m.optString("winStart", "00:00")
+                val we = m.optString("winEnd", "23:59")
+                wr.addView(btn("From " + Core.fmt12(ws), p.gold, p.gold, true) {
+                    collect()
+                    pickTime(ws) { nt -> m.put("winStart", nt); show() }
+                }, lp(0, -2, 0, 0, 8, 0).apply { weight = 1f })
+                wr.addView(btn("Until " + Core.fmt12(we), p.gold, p.gold, true) {
+                    collect()
+                    pickTime(we) { nt -> m.put("winEnd", nt); show() }
+                }, lp(0, -2).apply { weight = 1f })
+                addView(wr)
             }
-            if (mode != "asneeded") {
-                addView(tx("Days of the week", 13f, p.mut, italic = true, serif = true), lp(-2, -2, 0, 10, 0, 0))
-                addView(dayRow)
-                addView(every, lp(-1, -2, 0, 6, 0, 0))
-                addView(con, lp(-1, -2, 0, 6, 0, 0))
-                addView(coff, lp(-1, -2, 0, 6, 0, 0))
+            if (mode == "asneeded") {
+                addView(tx("No alarms. Use Take now on the Today screen when you need a dose.", 13f, p.mut, italic = true, serif = true), lp(-2, -2, 0, 8, 0, 0))
+            } else {
+                addView(lab("DAYS")); addView(dayRow)
+                addView(hrow(
+                    pill("Every day", false) { setDays(listOf(1, 2, 3, 4, 5, 6, 7)) },
+                    pill("Weekdays", false) { setDays(listOf(2, 3, 4, 5, 6)) },
+                    pill("Weekends", false) { setDays(listOf(1, 7)) }
+                ), lp(-1, -2, 0, 8, 0, 0))
+                addView(lab("REPEAT EVERY N DAYS (1 = DAILY)")); addView(every)
+                addView(lab("CYCLE: DAYS ON / DAYS OFF (OPTIONAL)"))
+                val cr = LinearLayout(context)
+                cr.addView(con, lp(0, -2, 0, 0, 8, 0).apply { weight = 1f })
+                cr.addView(coff, lp(0, -2).apply { weight = 1f })
+                addView(cr)
             }
-            for (v in listOf<View>(start, end, stock, notes)) addView(v, lp(-1, -2, 0, 6, 0, 0))
-            val r = LinearLayout(context)
-            r.addView(btn("Save", p.gold, p.onAcc) {
+        }
+        addCard(p.ok) {
+            addView(tx("Duration", 18f, p.ink, bold = true, serif = true))
+            addView(lab("STARTS"))
+            addView(btn(fmtDate(start), p.gold, p.gold, true) {
                 collect()
-                if (m.optString("start") == "") m.put("start", Core.ymd(Calendar.getInstance()))
-                val err = validate()
-                if (err != null) {
-                    toast(err)
-                } else {
-                    val doSave = {
-                        m.remove("isNew")
-                        Core.upsert(this@MainActivity, m)
-                        editing = null
-                        show()
-                    }
-                    val w = Core.warn(m)
-                    if (w == null) {
-                        doSave()
-                    } else {
-                        AlertDialog.Builder(this@MainActivity).setTitle("Please double-check").setMessage(w)
-                            .setPositiveButton("Save anyway") { _, _ -> doSave() }
-                            .setNegativeButton("Edit", null).show()
-                    }
+                pickDate(start.ifBlank { Core.ymd(Calendar.getInstance()) }) { nd -> m.put("start", nd); show() }
+            })
+            addView(lab("LAST DAY"))
+            addView(btn(if (end.isBlank()) "Ongoing" else fmtDate(end), p.gold, p.gold, true) {
+                collect()
+                pickDate(end.ifBlank { start }) { nd -> m.put("end", nd); show() }
+            })
+            addView(lab("QUICK DURATION")); addView(durPills)
+        }
+        addCard(p.bad) {
+            addView(tx("Extras", 18f, p.ink, bold = true, serif = true))
+            addView(lab("STOCK (UNITS LEFT)")); addView(stock)
+            addView(lab("NOTES")); addView(notes)
+            addView(foodPills, lp(-1, -2, 0, 8, 0, 0))
+        }
+
+        val r = LinearLayout(this)
+        r.addView(btn("Save", p.gold, p.onAcc) {
+            collect()
+            if (m.optString("start") == "") m.put("start", Core.ymd(Calendar.getInstance()))
+            val err = validate()
+            if (err != null) {
+                toast(err)
+            } else {
+                val doSave = {
+                    m.remove("isNew")
+                    Core.upsert(this@MainActivity, m)
+                    editing = null
+                    show()
                 }
-            }, lp(-2, -2, 0, 12, 8, 0))
-            r.addView(btn("Cancel", p.mut, p.mut, true) { editing = null; show() }, lp(-2, -2, 0, 12, 0, 0))
-            addView(r)
-            if (!isNew) addView(btn("Delete medicine", p.bad, p.bad, true) {
+                val w = Core.warn(m)
+                if (w == null) {
+                    doSave()
+                } else {
+                    AlertDialog.Builder(this@MainActivity).setTitle("Please double-check").setMessage(w)
+                        .setPositiveButton("Save anyway") { _, _ -> doSave() }
+                        .setNegativeButton("Edit", null).show()
+                }
+            }
+        }, lp(-2, -2, 0, 10, 8, 0))
+        r.addView(btn("Cancel", p.mut, p.mut, true) { editing = null; show() }, lp(-2, -2, 0, 10, 0, 0))
+        box.addView(r)
+        if (!isNew) {
+            val r2 = LinearLayout(this)
+            r2.addView(btn("Duplicate", p.gold, p.gold, true) {
+                collect()
+                val cp = JSONObject(m.toString())
+                cp.put("id", "m" + System.currentTimeMillis())
+                cp.put("name", m.getString("name") + " (copy)")
+                cp.put("isNew", true)
+                editing = cp
+                show()
+            }, lp(-2, -2, 0, 8, 8, 0))
+            r2.addView(btn("Delete", p.bad, p.bad, true) {
                 Core.delete(this@MainActivity, m.getString("id"))
                 editing = null
                 show()
-            }, lp(-2, -2, 0, 10, 0, 0))
+            }, lp(-2, -2, 0, 8, 0, 0))
+            box.addView(r2)
         }
     }
 
@@ -994,7 +1277,7 @@ class MainActivity : Activity() {
             if (aiMsg != "") addView(tx(aiMsg, 14f, p.time, italic = true, serif = true), lp(-2, -2, 0, 8, 0, 0))
         }
         ai.forEach { m ->
-            val col = medColor(m.getString("id"))
+            val col = colorFor(m)
             addCard(col) {
                 addView(tx(m.getString("name"), 18f, p.ink, bold = true, serif = true))
                 if (m.optString("dose") != "") addView(tx(m.optString("dose"), 15f, col, bold = true))
