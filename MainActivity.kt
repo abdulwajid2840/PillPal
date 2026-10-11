@@ -29,6 +29,7 @@ import android.text.TextWatcher
 import android.text.method.PasswordTransformationMethod
 import android.widget.ImageView
 import android.widget.HorizontalScrollView
+import java.time.format.DateTimeFormatter
 import android.app.TimePickerDialog
 import android.app.DatePickerDialog
 import java.text.SimpleDateFormat
@@ -810,7 +811,7 @@ class MainActivity : Activity() {
             override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
             override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
         })
-        val f = tx("Made by @abdulwajid2840 · GitHub", 13f, p.gold, italic = true, serif = true)
+        val f = tx("Made with ♥ by @abdulwajid2840", 13f, p.gold, italic = true, serif = true)
         f.gravity = Gravity.CENTER
         f.setPadding(0, dp(12), 0, dp(12))
         f.setOnClickListener { openUrl(GITHUB_PROFILE) }
@@ -998,6 +999,127 @@ class MainActivity : Activity() {
         m.put("times", JSONArray(l.distinct().sorted()))
     }
 
+    private fun fmtShort(s: String): String {
+        if (s.isBlank()) return ""
+        return runCatching {
+            SimpleDateFormat("d MMM yyyy", Locale.getDefault()).format(SimpleDateFormat("yyyy-MM-dd", Locale.US).parse(s)!!)
+        }.getOrDefault(s)
+    }
+
+    private fun rangePicker(startS: String, endS: String, onDone: (String, String) -> Unit) {
+        var from: LocalDate? = runCatching { LocalDate.parse(startS) }.getOrNull()
+        var to: LocalDate? = runCatching { LocalDate.parse(endS) }.getOrNull()
+        var month: LocalDate = (from ?: LocalDate.now()).withDayOfMonth(1)
+        val wrap = LinearLayout(this)
+        wrap.orientation = LinearLayout.VERTICAL
+        wrap.setPadding(dp(14), dp(14), dp(14), dp(6))
+        wrap.background = bg(p.card, 24f)
+        val head = LinearLayout(this)
+        head.gravity = Gravity.CENTER_VERTICAL
+        val title = tx("", 18f, p.ink, bold = true, serif = true)
+        title.gravity = Gravity.CENTER
+        val prev = tx("‹", 26f, p.gold, bold = true)
+        val next = tx("›", 26f, p.gold, bold = true)
+        prev.setPadding(dp(14), 0, dp(14), 0)
+        next.setPadding(dp(14), 0, dp(14), 0)
+        head.addView(prev)
+        head.addView(title, LinearLayout.LayoutParams(0, -2, 1f))
+        head.addView(next)
+        val summary = tx("", 13f, p.time, italic = true, serif = true)
+        summary.gravity = Gravity.CENTER
+        val grid = LinearLayout(this)
+        grid.orientation = LinearLayout.VERTICAL
+        wrap.addView(head)
+        wrap.addView(summary, lp(-1, -2, 0, 4, 0, 6))
+        wrap.addView(grid)
+        val today = LocalDate.now()
+        fun render() {
+            title.text = month.format(DateTimeFormatter.ofPattern("MMMM yyyy", Locale.getDefault()))
+            val f = from
+            val t = to
+            summary.text = if (f == null) {
+                "Tap a start date"
+            } else if (t == null) {
+                "From " + fmtShort(f.toString()) + " · tap an end date"
+            } else {
+                fmtShort(f.toString()) + "  →  " + fmtShort(t.toString())
+            }
+            grid.removeAllViews()
+            val hdr = LinearLayout(this)
+            for (d in listOf("S", "M", "T", "W", "T", "F", "S")) {
+                val h = tx(d, 12f, p.mut, bold = true)
+                h.gravity = Gravity.CENTER
+                hdr.addView(h, LinearLayout.LayoutParams(0, -2, 1f))
+            }
+            grid.addView(hdr)
+            val offset = month.dayOfWeek.value % 7
+            val len = month.lengthOfMonth()
+            for (row in 0..5) {
+                val rl = LinearLayout(this)
+                for (col in 0..6) {
+                    val dayNum = row * 7 + col - offset + 1
+                    val cell = tx(if (dayNum in 1..len) dayNum.toString() else "", 14f, p.ink)
+                    cell.gravity = Gravity.CENTER
+                    cell.setPadding(0, dp(10), 0, dp(10))
+                    if (dayNum in 1..len) {
+                        val date = month.withDayOfMonth(dayNum)
+                        val edge = (date == f) || (date == t)
+                        val inside = f != null && t != null && date.isAfter(f) && date.isBefore(t)
+                        if (edge) {
+                            cell.setTextColor(p.onAcc)
+                            cell.background = bg(p.gold, 20f)
+                        } else if (inside) {
+                            cell.background = bg(p.hi, 6f)
+                        } else if (date == today) {
+                            cell.background = bg(Color.TRANSPARENT, 20f, p.time, 1)
+                        }
+                        cell.setOnClickListener {
+                            val cf = from
+                            if (cf == null || to != null) {
+                                from = date
+                                to = null
+                            } else if (date.isBefore(cf)) {
+                                to = cf
+                                from = date
+                            } else {
+                                to = date
+                            }
+                            render()
+                        }
+                    }
+                    rl.addView(cell, lp(0, -2, 1, 1, 1, 1).apply { weight = 1f })
+                }
+                grid.addView(rl)
+            }
+        }
+        prev.setOnClickListener {
+            month = month.minusMonths(1)
+            render()
+        }
+        next.setOnClickListener {
+            month = month.plusMonths(1)
+            render()
+        }
+        render()
+        val dlg = AlertDialog.Builder(this).setView(wrap)
+            .setPositiveButton("Apply") { _, _ ->
+                val f = from
+                if (f != null) onDone(f.toString(), to?.toString() ?: "")
+            }
+            .setNeutralButton("Ongoing") { _, _ ->
+                val f = from
+                onDone(f?.toString() ?: startS, "")
+            }
+            .setNegativeButton("Cancel", null).create()
+        dlg.setOnShowListener {
+            dlg.window?.setBackgroundDrawable(bg(p.card, 24f))
+            for (b in listOf(AlertDialog.BUTTON_POSITIVE, AlertDialog.BUTTON_NEUTRAL, AlertDialog.BUTTON_NEGATIVE)) {
+                dlg.getButton(b).setTextColor(p.gold)
+            }
+        }
+        dlg.show()
+    }
+
     private fun form(m: JSONObject) {
         val isNew = m.optBoolean("isNew")
         val mode = Core.mode(m)
@@ -1073,7 +1195,6 @@ class MainActivity : Activity() {
             }
             dayRow.addView(t, lp(0, -2, 2, 0, 2, 0).apply { weight = 1f })
         }
-        fun setDays(l: List<Int>) = redo { m.put("days", JSONArray(l)) }
 
         // fixed times
         val tl = Core.strs(m.getJSONArray("times"))
@@ -1186,11 +1307,6 @@ class MainActivity : Activity() {
                 addView(tx("No alarms. Use Take now on the Today screen when you need a dose.", 13f, p.mut, italic = true, serif = true), lp(-2, -2, 0, 8, 0, 0))
             } else {
                 addView(lab("DAYS")); addView(dayRow)
-                addView(hrow(
-                    pill("Every day", false) { setDays(listOf(1, 2, 3, 4, 5, 6, 7)) },
-                    pill("Weekdays", false) { setDays(listOf(2, 3, 4, 5, 6)) },
-                    pill("Weekends", false) { setDays(listOf(1, 7)) }
-                ), lp(-1, -2, 0, 8, 0, 0))
                 addView(lab("REPEAT EVERY N DAYS (1 = DAILY)")); addView(every)
                 addView(lab("CYCLE: DAYS ON / DAYS OFF (OPTIONAL)"))
                 val cr = LinearLayout(context)
@@ -1201,15 +1317,15 @@ class MainActivity : Activity() {
         }
         addCard(p.ok) {
             addView(tx("Duration", 18f, p.ink, bold = true, serif = true))
-            addView(lab("STARTS"))
-            addView(btn(fmtDate(start), p.gold, p.gold, true) {
+            addView(lab("DATES"))
+            val rl = (if (start.isBlank()) "Today" else fmtShort(start)) + "  →  " + (if (end.isBlank()) "Ongoing" else fmtShort(end))
+            addView(btn(rl, p.gold, p.gold, true) {
                 collect()
-                pickDate(start.ifBlank { Core.ymd(Calendar.getInstance()) }) { nd -> m.put("start", nd); show() }
-            })
-            addView(lab("LAST DAY"))
-            addView(btn(if (end.isBlank()) "Ongoing" else fmtDate(end), p.gold, p.gold, true) {
-                collect()
-                pickDate(end.ifBlank { start }) { nd -> m.put("end", nd); show() }
+                rangePicker(start.ifBlank { Core.ymd(Calendar.getInstance()) }, end) { f, t ->
+                    m.put("start", f)
+                    m.put("end", t)
+                    show()
+                }
             })
             addView(lab("QUICK DURATION")); addView(durPills)
         }
@@ -1220,8 +1336,7 @@ class MainActivity : Activity() {
             addView(foodPills, lp(-1, -2, 0, 8, 0, 0))
         }
 
-        val r = LinearLayout(this)
-        r.addView(btn("Save", p.gold, p.onAcc) {
+        val saveB = btn("Save", p.gold, p.onAcc) {
             collect()
             if (m.optString("start") == "") m.put("start", Core.ymd(Calendar.getInstance()))
             val err = validate()
@@ -1243,12 +1358,11 @@ class MainActivity : Activity() {
                         .setNegativeButton("Edit", null).show()
                 }
             }
-        }, lp(-2, -2, 0, 10, 8, 0))
-        r.addView(btn("Cancel", p.mut, p.mut, true) { editing = null; show() }, lp(-2, -2, 0, 10, 0, 0))
-        box.addView(r)
+        }
+        val cancelB = btn("Cancel", p.mut, p.mut, true) { editing = null; show() }
+        val items = mutableListOf<Button>(saveB, cancelB)
         if (!isNew) {
-            val r2 = LinearLayout(this)
-            r2.addView(btn("Duplicate", p.gold, p.gold, true) {
+            items.add(btn("Duplicate", p.gold, p.gold, true) {
                 collect()
                 val cp = JSONObject(m.toString())
                 cp.put("id", "m" + System.currentTimeMillis())
@@ -1256,14 +1370,20 @@ class MainActivity : Activity() {
                 cp.put("isNew", true)
                 editing = cp
                 show()
-            }, lp(-2, -2, 0, 8, 8, 0))
-            r2.addView(btn("Delete", p.bad, p.bad, true) {
+            })
+            items.add(btn("Delete", p.bad, p.bad, true) {
                 Core.delete(this@MainActivity, m.getString("id"))
                 editing = null
                 show()
-            }, lp(-2, -2, 0, 8, 0, 0))
-            box.addView(r2)
+            })
         }
+        val bar = LinearLayout(this)
+        items.forEach { b ->
+            b.textSize = 13f
+            b.setPadding(dp(4), 0, dp(4), 0)
+            bar.addView(b, lp(0, -2, 0, 0, 6, 0).apply { weight = 1f })
+        }
+        box.addView(bar, lp(-1, -2, 0, 12, 0, 0))
     }
 
     // ---------- Ask AI ----------
@@ -1396,8 +1516,9 @@ class MainActivity : Activity() {
         }
         addCard(p.gold, true) {
             addView(tx("About PillPal", 18f, p.ink, bold = true, serif = true))
-            addView(tx("A personal project, built on a phone with Gemini helping to read schedules.", 13f, p.mut, italic = true, serif = true))
-            addView(btn("GitHub · @abdulwajid2840", p.gold, p.onAcc) { openUrl(GITHUB_PROFILE) }, lp(-2, -2, 0, 10, 0, 0))
+            addView(tx("Made with ♥ by @abdulwajid2840", 16f, p.gold, bold = true, serif = true))
+            addView(tx("Built on a phone, with Gemini helping to read schedules.", 13f, p.mut, italic = true, serif = true))
+            addView(btn("Visit my GitHub", p.gold, p.onAcc) { openUrl(GITHUB_PROFILE) }, lp(-2, -2, 0, 10, 0, 0))
             addView(btn("Setup guide", p.gold, p.gold, true) { openUrl(GITHUB_HELP) }, lp(-2, -2, 0, 8, 0, 0))
         }
     }
