@@ -1,3 +1,5 @@
+<img width="1080" height="3429" alt="Screenshot_2026-10-12-01-26-13-025_com jaby pillpal" src="https://github.com/user-attachments/assets/72b693df-88aa-44e5-8cd8-0ed54caf7a0e" />
+
 # PillPal
 
 **Private, safe and lightweight medication reminders for Android.**
