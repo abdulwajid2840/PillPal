@@ -144,10 +144,6 @@ PillPal is inspired by the open-source [MedTimer](https://github.com/Futsch1/med
 
 The application was developed by [@abdulwajid2840](https://github.com/abdulwajid2840) with AI-assisted coding (Claude by Anthropic), and tested on a real Android device.
 
-## License
-
-No license has been chosen yet. Add one (for example MIT) before others reuse or redistribute the code.
-
 ---
 
 Made with ♥ by [@abdulwajid2840](https://github.com/abdulwajid2840)
