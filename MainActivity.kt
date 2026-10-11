@@ -22,6 +22,12 @@ import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.RippleDrawable
 import android.view.Gravity
 import android.view.View
+import android.view.animation.OvershootInterpolator
+import android.graphics.drawable.Drawable
+import android.text.Editable
+import android.text.TextWatcher
+import android.text.method.PasswordTransformationMethod
+import android.widget.ImageView
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.Date
@@ -43,6 +49,9 @@ import java.util.Calendar
 import kotlin.concurrent.thread
 
 /* ---------------- Core: storage, scheduling, notifications, Gemini ---------------- */
+private const val GITHUB_PROFILE = "https://github.com/abdulwajid2840"
+private const val GITHUB_HELP = "https://github.com/abdulwajid2840/PillPal#get-a-gemini-api-key"
+
 object Core {
     fun sp(c: Context) = c.getSharedPreferences("pp", 0)
     fun ints(a: JSONArray) = List(a.length()) { a.getInt(it) }
@@ -172,7 +181,7 @@ object Core {
         }
     }
 
-    // ---- when is a remedy active on a day ----
+    // ---- when is a medicine active on a day ----
     fun activeOn(m: JSONObject, cal: Calendar): Boolean {
         val day = ymd(cal)
         val end = m.optString("end", "")
@@ -419,6 +428,9 @@ class MainActivity : Activity() {
     private var aiMsg = ""
     private var aiText = ""
     private var editing: JSONObject? = null
+    private var host: LinearLayout? = null
+    private var query = ""
+    private var navShown = -1
 
     // ---------- theme ----------
     private fun c(s: String) = Color.parseColor(s)
@@ -499,7 +511,7 @@ class MainActivity : Activity() {
         val inner = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(14), dp(12), dp(14), dp(12)) }
         inner.build()
         outer.addView(inner, LinearLayout.LayoutParams(0, -2, 1f))
-        box.addView(outer, lp(-1, -2, 2, 7, 2, 7))
+        (host ?: box).addView(outer, lp(-1, -2, 2, 7, 2, 7))
     }
     private fun ornament(): LinearLayout {
         val r = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
@@ -544,15 +556,19 @@ class MainActivity : Activity() {
         Core.channel(this)
         if (Build.VERSION.SDK_INT >= 33) requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
         window.statusBarColor = p.bg
-        window.navigationBarColor = p.card
+        window.navigationBarColor = p.bg
         lightBars(!p.dark)
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setBackgroundColor(p.bg); fitsSystemWindows = true }
         scroll = ScrollView(this)
         box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(16), dp(10), dp(16), dp(24)) }
         scroll.addView(box)
-        nav = LinearLayout(this).apply { setBackgroundColor(p.card); elevation = dp(8).toFloat(); setPadding(dp(8), dp(6), dp(8), dp(6)) }
+        nav = LinearLayout(this)
+        nav.background = bg(p.card, 30f, p.line, 1)
+        nav.elevation = dp(10).toFloat()
+        nav.gravity = Gravity.CENTER_VERTICAL
+        nav.setPadding(dp(8), dp(8), dp(8), dp(8))
         root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
-        root.addView(nav, LinearLayout.LayoutParams(-1, -2))
+        root.addView(nav, lp(-1, -2, 14, 4, 14, 12))
         setContentView(root)
         Core.scheduleAll(this)
         show()
@@ -595,42 +611,124 @@ class MainActivity : Activity() {
 
     private fun buildNav() {
         nav.removeAllViews()
-        val names = listOf("Today", "Remedies", "Ask AI", "Settings")
+        val names = listOf("Today", "Medicines", "Ask AI", "Settings")
+        val icons = listOf(R.drawable.ic_today, R.drawable.ic_meds, R.drawable.ic_ai, R.drawable.ic_settings)
         for (i in names.indices) {
             val on = (tab == i)
-            val tc = if (on) p.gold else p.mut
-            val t = tx(names[i], 14f, tc, bold = on, serif = true)
-            t.gravity = Gravity.CENTER
-            t.setPadding(0, dp(10), 0, dp(10))
+            val item = LinearLayout(this)
+            item.gravity = Gravity.CENTER
+            item.setPadding(dp(10), dp(11), dp(10), dp(11))
             if (on) {
-                t.background = bg(p.hi, 20f, p.gold, 1)
+                item.background = bg(p.hi, 22f, p.gold, 1)
+            } else {
+                item.background = RippleDrawable(ColorStateList.valueOf(withA(p.gold, 0x33)), null, bg(Color.WHITE, 22f))
             }
-            t.setOnClickListener {
-                tab = i
-                editing = null
-                scroll.scrollTo(0, 0)
-                show()
+            val ic = ImageView(this)
+            ic.setImageResource(icons[i])
+            ic.setColorFilter(if (on) p.gold else p.mut)
+            item.addView(ic, LinearLayout.LayoutParams(dp(24), dp(24)))
+            if (on) {
+                val lb = tx(names[i], 13f, p.gold, bold = true, serif = true)
+                lb.setPadding(dp(8), 0, 0, 0)
+                lb.maxLines = 1
+                item.addView(lb)
+                if (navShown != i) {
+                    lb.alpha = 0f
+                    lb.animate().alpha(1f).setDuration(300).start()
+                    ic.scaleX = 0.5f
+                    ic.scaleY = 0.5f
+                    ic.animate().scaleX(1f).scaleY(1f).setDuration(380).setInterpolator(OvershootInterpolator(2.5f)).start()
+                }
             }
-            val params = lp(0, -2, 4, 0, 4, 0)
-            params.weight = 1f
-            nav.addView(t, params)
+            item.setOnClickListener {
+                if (tab != i) {
+                    tab = i
+                    editing = null
+                    scroll.scrollTo(0, 0)
+                    box.alpha = 0f
+                    show()
+                    box.animate().alpha(1f).setDuration(220).start()
+                }
+            }
+            val params = lp(0, -2, 2, 0, 2, 0)
+            params.weight = if (on) 2.3f else 1f
+            nav.addView(item, params)
         }
+        navShown = tab
     }
 
     // ---------- Today ----------
+    private fun openUrl(u: String) {
+        try {
+            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(u)))
+        } catch (e: Exception) {
+            toast("No browser found")
+        }
+    }
+    private fun icon(res: Int, col: Int): Drawable {
+        val d = resources.getDrawable(res, theme).mutate()
+        d.setTint(col)
+        return d
+    }
+    private fun hit(m: JSONObject, extra: String, q: String): Boolean {
+        if (q.isBlank()) return true
+        val hay = (m.optString("name") + " " + m.optString("dose") + " " + m.optString("notes") + " " + extra + " " + describe(m)).lowercase()
+        return q.lowercase().split(" ").filter { it.isNotBlank() }.all { hay.contains(it) }
+    }
+
     private fun today() {
         val now = Calendar.getInstance()
         heading("Today", SimpleDateFormat("EEEE, d MMMM", Locale.getDefault()).format(now.time))
+        val search = field("Search name, dose, time, notes...", query)
+        search.background = bg(p.card, 22f, p.line, 1)
+        search.isSingleLine = true
+        search.setCompoundDrawablesRelativeWithIntrinsicBounds(icon(R.drawable.ic_search, p.mut), null, null, null)
+        search.compoundDrawablePadding = dp(10)
+        box.addView(search, lp(-1, -2, 0, 0, 0, 6))
+        val list = LinearLayout(this)
+        list.orientation = LinearLayout.VERTICAL
+        box.addView(list)
+        fun fill() {
+            list.removeAllViews()
+            host = list
+            renderToday(now, query)
+            host = null
+        }
+        fill()
+        search.addTextChangedListener(object : TextWatcher {
+            override fun afterTextChanged(s: Editable?) {
+                query = s?.toString() ?: ""
+                fill()
+            }
+            override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+            override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+        })
+        val f = tx("Made by @abdulwajid2840 · GitHub", 13f, p.gold, italic = true, serif = true)
+        f.gravity = Gravity.CENTER
+        f.setPadding(0, dp(12), 0, dp(12))
+        f.setOnClickListener { openUrl(GITHUB_PROFILE) }
+        box.addView(f, lp(-1, -2, 0, 16, 0, 0))
+    }
+
+    private fun renderToday(now: Calendar, q: String) {
         val ds = Core.dosesToday(this)
-        val rep = Core.repeatingToday(this)
+        val rep0 = Core.repeatingToday(this)
         val stat = ds.map { Core.getLog(this, Core.key(it.first.getString("id"), it.second)) }
         val done = stat.count { it != null }
-        if (ds.isEmpty() && rep.isEmpty()) {
+        val filtering = q.isNotBlank()
+        val idx = ds.indices.filter { hit(ds[it].first, ds[it].second + " " + (stat[it] ?: "pending"), q) }
+        val rep = rep0.filter { hit(it, if (Core.mode(it) == "interval") "repeating" else "as needed", q) }
+        if (ds.isEmpty() && rep0.isEmpty()) {
             addCard(p.gold) {
                 addView(tx("A quiet day", 18f, p.ink, bold = true, serif = true))
-                addView(tx("Nothing is scheduled. Add a remedy under Remedies or Ask AI.", 14f, p.mut))
+                addView(tx("Nothing is scheduled. Add a medicine under Medicines or Ask AI.", 14f, p.mut))
             }
-        } else if (ds.isNotEmpty()) {
+        } else if (filtering && idx.isEmpty() && rep.isEmpty()) {
+            addCard(p.gold) {
+                addView(tx("No match", 18f, p.ink, bold = true, serif = true))
+                addView(tx("Nothing today matches \"$q\". Try a name, dose, time or word like taken.", 14f, p.mut))
+            }
+        } else if (!filtering && ds.isNotEmpty()) {
             addCard(p.gold) {
                 addView(tx("$done of ${ds.size} doses marked", 15f, p.mut, italic = true, serif = true))
                 val bar = LinearLayout(context).apply { background = bg(p.line, 6f); clipToOutline = true }
@@ -639,16 +737,20 @@ class MainActivity : Activity() {
                 addView(bar, lp(-1, dp(8), 0, 8, 0, 2))
             }
         }
-        Core.meds(this).filter { it.optInt("stock", -1) in 0..5 }.forEach { m ->
-            addCard(p.bad) {
-                addView(tx("Refill soon", 12f, p.bad, bold = true))
-                addView(tx("${m.getString("name")} · ${m.getInt("stock")} left", 16f, p.ink, serif = true))
+        if (!filtering) {
+            Core.meds(this).filter { it.optInt("stock", -1) in 0..5 }.forEach { m ->
+                addCard(p.bad) {
+                    addView(tx("Refill soon", 12f, p.bad, bold = true))
+                    addView(tx("${m.getString("name")} · ${m.getInt("stock")} left", 16f, p.ink, serif = true))
+                }
             }
         }
         val nowS = "%02d:%02d".format(now.get(Calendar.HOUR_OF_DAY), now.get(Calendar.MINUTE))
         val nextIdx = ds.indices.firstOrNull { stat[it] == null && ds[it].second >= nowS }
             ?: ds.indices.firstOrNull { stat[it] == null } ?: -1
-        ds.forEachIndexed { i, (m, t) ->
+        idx.forEach { i ->
+            val m = ds[i].first
+            val t = ds[i].second
             val id = m.getString("id")
             val st = stat[i]
             val col = medColor(id)
@@ -713,7 +815,7 @@ class MainActivity : Activity() {
         }
     }
 
-    // ---------- Remedies ----------
+    // ---------- Medicines ----------
     private fun newMed(): JSONObject = JSONObject().put("id", "m" + System.currentTimeMillis()).put("name", "").put("dose", "").put("per", 1)
         .put("mode", "times").put("times", JSONArray().put("08:00")).put("intervalMin", 0)
         .put("winStart", "00:00").put("winEnd", "23:59")
@@ -721,14 +823,14 @@ class MainActivity : Activity() {
         .put("start", Core.ymd(Calendar.getInstance())).put("end", "").put("stock", -1).put("notes", "").put("isNew", true)
 
     private fun medsList() {
-        heading("Remedies", "Your medicine shelf")
-        box.addView(btn("+ Add remedy", p.gold, p.onAcc) {
+        heading("Medicines", "Your medicine shelf")
+        box.addView(btn("+ Add medicine", p.gold, p.onAcc) {
             editing = newMed()
             scroll.scrollTo(0, 0)
             show()
         }, lp(-2, -2, 0, 4, 0, 8))
         val l = Core.meds(this)
-        if (l.isEmpty()) addCard(p.gold) { addView(tx("The shelf is empty. Add a remedy by hand or with Ask AI.", 14f, p.mut)) }
+        if (l.isEmpty()) addCard(p.gold) { addView(tx("The shelf is empty. Add a medicine by hand or with Ask AI.", 14f, p.mut)) }
         l.forEach { m ->
             val col = medColor(m.getString("id"))
             addCard(col) {
@@ -749,7 +851,7 @@ class MainActivity : Activity() {
     private fun form(m: JSONObject) {
         val isNew = m.optBoolean("isNew")
         val mode = Core.mode(m)
-        heading(if (isNew) "New remedy" else "Edit remedy", "Fill in the details")
+        heading(if (isNew) "New medicine" else "Edit medicine", "Fill in the details")
         val name = field("Name", m.getString("name"))
         val dose = field("Dose (e.g. 500 mg)", m.optString("dose"))
         val per = field("Units per dose", m.optInt("per", 1).toString())
@@ -873,7 +975,7 @@ class MainActivity : Activity() {
             }, lp(-2, -2, 0, 12, 8, 0))
             r.addView(btn("Cancel", p.mut, p.mut, true) { editing = null; show() }, lp(-2, -2, 0, 12, 0, 0))
             addView(r)
-            if (!isNew) addView(btn("Delete remedy", p.bad, p.bad, true) {
+            if (!isNew) addView(btn("Delete medicine", p.bad, p.bad, true) {
                 Core.delete(this@MainActivity, m.getString("id"))
                 editing = null
                 show()
@@ -947,18 +1049,37 @@ class MainActivity : Activity() {
             listOf("system" to "System", "light" to "Light", "dark" to "Dark").forEach { (k, n) ->
                 r.addView(
                     if (cur == k) btn(n, p.gold, p.onAcc) {} else btn(n, p.mut, p.mut, true) {
-                        sp.edit().putString("theme", k).apply(); recreate()
+                        sp.edit().putString("theme", k).apply()
+                        recreate()
                     }, lp(-2, -2, 0, 8, 8, 0)
                 )
             }
             addView(r)
         }
         val key = field("AIza...", sp.getString("key", "") ?: "")
+        key.transformationMethod = PasswordTransformationMethod.getInstance()
         val model = field("Model", sp.getString("model", "gemini-3.5-flash-lite") ?: "gemini-3.5-flash-lite")
+        var shown = false
+        val tog = btn("Show", p.mut, p.mut, true) {}
+        tog.setOnClickListener {
+            shown = !shown
+            key.transformationMethod = if (shown) null else PasswordTransformationMethod.getInstance()
+            tog.text = if (shown) "Hide" else "Show"
+        }
+        val help = tx("?", 17f, p.gold, bold = true, serif = true)
+        help.gravity = Gravity.CENTER
+        help.background = bg(p.hi, 18f, p.gold, 1)
+        help.setOnClickListener { openUrl(GITHUB_HELP) }
         addCard(p.time) {
-            addView(tx("Gemini API", 18f, p.ink, bold = true, serif = true))
-            addView(tx("Key from aistudio.google.com", 13f, p.mut, italic = true, serif = true))
-            addView(key, lp(-1, -2, 0, 6, 0, 0)); addView(model, lp(-1, -2, 0, 6, 0, 0))
+            val hdr = LinearLayout(context)
+            hdr.gravity = Gravity.CENTER_VERTICAL
+            hdr.addView(tx("Gemini API", 18f, p.ink, bold = true, serif = true), LinearLayout.LayoutParams(0, -2, 1f))
+            hdr.addView(help, LinearLayout.LayoutParams(dp(36), dp(36)))
+            addView(hdr)
+            addView(tx("Tap ? for a step by step guide to get your key", 13f, p.mut, italic = true, serif = true))
+            addView(key, lp(-1, -2, 0, 6, 0, 0))
+            addView(tog, lp(-2, -2, 0, 6, 0, 0))
+            addView(model, lp(-1, -2, 0, 6, 0, 0))
             addView(btn("Save", p.gold, p.onAcc) {
                 sp.edit().putString("key", key.text.toString().trim())
                     .putString("model", model.text.toString().trim().ifEmpty { "gemini-3.5-flash-lite" }).apply()
@@ -967,21 +1088,34 @@ class MainActivity : Activity() {
         }
         addCard(p.ok) {
             addView(tx("Reminders", 18f, p.ink, bold = true, serif = true))
-            if (Build.VERSION.SDK_INT in 31..32) addView(btn("Allow exact alarms", p.gold, p.gold, true) {
-                startActivity(Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM, Uri.parse("package:$packageName")))
-            }, lp(-2, -2, 0, 8, 0, 0))
+            if (Build.VERSION.SDK_INT in 31..32) {
+                addView(btn("Allow exact alarms", p.gold, p.gold, true) {
+                    startActivity(Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM, Uri.parse("package:$packageName")))
+                }, lp(-2, -2, 0, 8, 0, 0))
+            }
             addView(btn("Test notification", p.gold, p.gold, true) {
-                Core.meds(this@MainActivity).firstOrNull()?.let { Core.notify(this@MainActivity, it, Core.strs(it.getJSONArray("times")).first()) }
-                    ?: toast("Add a remedy first")
+                val first = Core.meds(this@MainActivity).firstOrNull()
+                if (first == null) {
+                    toast("Add a medicine first")
+                } else {
+                    val tm = if (Core.mode(first) == "times") Core.strs(first.getJSONArray("times")).firstOrNull() ?: "~" else "~"
+                    Core.notify(this@MainActivity, first, tm)
+                }
             }, lp(-2, -2, 0, 8, 0, 0))
         }
         addCard(p.bad) {
             addView(tx("Backup", 18f, p.ink, bold = true, serif = true))
-            addView(tx("Saves your remedies and history to a file. Your API key is not included.", 13f, p.mut, italic = true, serif = true))
+            addView(tx("Saves your medicines and history to a file. Your API key is not included.", 13f, p.mut, italic = true, serif = true))
             val r = LinearLayout(context)
             r.addView(btn("Export", p.gold, p.onAcc) { exportBackup() }, lp(-2, -2, 0, 10, 8, 0))
             r.addView(btn("Import", p.gold, p.gold, true) { importBackup() }, lp(-2, -2, 0, 10, 0, 0))
             addView(r)
+        }
+        addCard(p.gold, true) {
+            addView(tx("About PillPal", 18f, p.ink, bold = true, serif = true))
+            addView(tx("A personal project, built on a phone with Gemini helping to read schedules.", 13f, p.mut, italic = true, serif = true))
+            addView(btn("GitHub · @abdulwajid2840", p.gold, p.onAcc) { openUrl(GITHUB_PROFILE) }, lp(-2, -2, 0, 10, 0, 0))
+            addView(btn("Setup guide", p.gold, p.gold, true) { openUrl(GITHUB_HELP) }, lp(-2, -2, 0, 8, 0, 0))
         }
     }
 
@@ -1008,9 +1142,9 @@ class MainActivity : Activity() {
             } else if (requestCode == 102) {
                 val txt = contentResolver.openInputStream(uri)?.bufferedReader()?.readText() ?: ""
                 AlertDialog.Builder(this).setTitle("Import backup?")
-                    .setMessage("This replaces your current remedies and history.")
+                    .setMessage("This replaces your current medicines and history.")
                     .setPositiveButton("Import") { _, _ ->
-                        try { val n = Core.importJson(this, txt); toast("Imported $n remedies"); show() }
+                        try { val n = Core.importJson(this, txt); toast("Imported $n medicines"); show() }
                         catch (e: Exception) { toast("Not a valid backup: " + e.message) }
                     }
                     .setNegativeButton("Cancel", null).show()
