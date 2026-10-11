@@ -28,6 +28,26 @@ import android.text.Editable
 import android.text.TextWatcher
 import android.text.method.PasswordTransformationMethod
 import android.widget.ImageView
+import android.graphics.Canvas
+import android.graphics.Paint
+import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyProperties
+import android.text.InputType
+import android.text.SpannableStringBuilder
+import android.text.Spanned
+import android.text.TextUtils
+import android.text.style.ForegroundColorSpan
+import android.text.style.StyleSpan
+import android.util.Base64
+import java.security.KeyStore
+import java.security.SecureRandom
+import javax.crypto.Cipher
+import javax.crypto.KeyGenerator
+import javax.crypto.SecretKey
+import javax.crypto.SecretKeyFactory
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.PBEKeySpec
+import javax.crypto.spec.SecretKeySpec
 import android.widget.HorizontalScrollView
 import java.time.format.DateTimeFormatter
 import android.app.TimePickerDialog
@@ -55,6 +75,66 @@ import kotlin.concurrent.thread
 /* ---------------- Core: storage, scheduling, notifications, Gemini ---------------- */
 private const val GITHUB_PROFILE = "https://github.com/abdulwajid2840"
 private const val GITHUB_HELP = "https://github.com/abdulwajid2840/PillPal#get-a-gemini-api-key"
+
+object Crypto {
+    private const val ALIAS = "pillpal_api_key"
+    private const val ITER = 120000
+
+    private fun storeKey(): SecretKey {
+        val ks = KeyStore.getInstance("AndroidKeyStore")
+        ks.load(null)
+        val existing = ks.getKey(ALIAS, null)
+        if (existing is SecretKey) return existing
+        val g = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
+        g.init(
+            KeyGenParameterSpec.Builder(ALIAS, KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT)
+                .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                .setKeySize(256).build()
+        )
+        return g.generateKey()
+    }
+    fun enc(plain: String): String {
+        val c = Cipher.getInstance("AES/GCM/NoPadding")
+        c.init(Cipher.ENCRYPT_MODE, storeKey())
+        val ct = c.doFinal(plain.toByteArray(Charsets.UTF_8))
+        return Base64.encodeToString(c.iv + ct, Base64.NO_WRAP)
+    }
+    fun dec(s: String): String {
+        val all = Base64.decode(s, Base64.NO_WRAP)
+        val c = Cipher.getInstance("AES/GCM/NoPadding")
+        c.init(Cipher.DECRYPT_MODE, storeKey(), GCMParameterSpec(128, all.copyOfRange(0, 12)))
+        return String(c.doFinal(all.copyOfRange(12, all.size)), Charsets.UTF_8)
+    }
+
+    private fun derive(pass: String, salt: ByteArray, iter: Int): SecretKey {
+        val f = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")
+        return SecretKeySpec(f.generateSecret(PBEKeySpec(pass.toCharArray(), salt, iter, 256)).encoded, "AES")
+    }
+    fun encryptWithPassword(plain: String, pass: String): String {
+        val rnd = SecureRandom()
+        val salt = ByteArray(16)
+        val iv = ByteArray(12)
+        rnd.nextBytes(salt)
+        rnd.nextBytes(iv)
+        val c = Cipher.getInstance("AES/GCM/NoPadding")
+        c.init(Cipher.ENCRYPT_MODE, derive(pass, salt, ITER), GCMParameterSpec(128, iv))
+        val ct = c.doFinal(plain.toByteArray(Charsets.UTF_8))
+        return JSONObject().put("app", "PillPal").put("enc", 1).put("kdf", "PBKDF2-HMAC-SHA256").put("iter", ITER)
+            .put("salt", Base64.encodeToString(salt, Base64.NO_WRAP))
+            .put("iv", Base64.encodeToString(iv, Base64.NO_WRAP))
+            .put("data", Base64.encodeToString(ct, Base64.NO_WRAP)).toString(2)
+    }
+    fun decryptWithPassword(json: String, pass: String): String {
+        val o = JSONObject(json)
+        val salt = Base64.decode(o.getString("salt"), Base64.NO_WRAP)
+        val iv = Base64.decode(o.getString("iv"), Base64.NO_WRAP)
+        val data = Base64.decode(o.getString("data"), Base64.NO_WRAP)
+        val c = Cipher.getInstance("AES/GCM/NoPadding")
+        c.init(Cipher.DECRYPT_MODE, derive(pass, salt, o.optInt("iter", ITER)), GCMParameterSpec(128, iv))
+        return String(c.doFinal(data), Charsets.UTF_8)
+    }
+}
 
 object Core {
     fun sp(c: Context) = c.getSharedPreferences("pp", 0)
@@ -88,6 +168,27 @@ object Core {
         val l = meds(c).toMutableList()
         l.firstOrNull { it.getString("id") == id }?.let { cancelAll(c, it) }
         saveMeds(c, l.filter { it.getString("id") != id })
+    }
+
+    // ---- API key (encrypted with the Android Keystore) ----
+    fun getKey(c: Context): String {
+        val enc = sp(c).getString("key_enc", "") ?: ""
+        if (enc.isNotEmpty()) return runCatching { Crypto.dec(enc) }.getOrDefault("")
+        val old = sp(c).getString("key", "") ?: ""
+        if (old.isNotEmpty()) {
+            setKey(c, old)
+            return old
+        }
+        return ""
+    }
+    fun setKey(c: Context, k: String) {
+        val e = sp(c).edit()
+        e.remove("key").remove("key_enc")
+        if (k.isNotEmpty()) {
+            val enc = runCatching { Crypto.enc(k) }.getOrNull()
+            if (enc != null) e.putString("key_enc", enc) else e.putString("key", k)
+        }
+        e.apply()
     }
 
     // ---- helpers ----
@@ -153,19 +254,45 @@ object Core {
     fun getLog(c: Context, k: String): String? = JSONObject(sp(c).getString("log", "{}")).optString(k, "").ifEmpty { null }
     fun count(c: Context, id: String): Int = getLog(c, key(id, "~"))?.toIntOrNull() ?: 0
 
+    private fun addEvent(c: Context, id: String, t: String, act: String) {
+        val m = med(c, id)
+        val a = JSONArray(sp(c).getString("events", "[]"))
+        a.put(
+            JSONObject().put("ts", System.currentTimeMillis()).put("id", id)
+                .put("name", m?.optString("name") ?: "Medicine").put("dose", m?.optString("dose") ?: "")
+                .put("sched", t).put("act", act)
+        )
+        var out = a
+        if (a.length() > 3000) {
+            out = JSONArray()
+            for (i in a.length() - 3000 until a.length()) out.put(a.getJSONObject(i))
+        }
+        sp(c).edit().putString("events", out.toString()).apply()
+    }
+    fun events(c: Context): List<JSONObject> {
+        val a = JSONArray(sp(c).getString("events", "[]"))
+        return List(a.length()) { a.getJSONObject(it) }
+    }
+    fun clearEvents(c: Context) {
+        sp(c).edit().remove("events").apply()
+    }
+
     fun mark(c: Context, id: String, t: String, st: String) {
         val lg = JSONObject(sp(c).getString("log", "{}"))
         val k = key(id, t)
         val prev = lg.optString(k, "")
         var delta = 0
+        var act = ""
         if (t == "~") {
             val cnt = prev.toIntOrNull() ?: 0
             if (st == "taken") {
                 lg.put(k, (cnt + 1).toString())
                 delta = 1
+                act = "taken"
             } else if (st == "" && cnt > 0) {
                 lg.put(k, (cnt - 1).toString())
                 delta = -1
+                act = "undo"
             }
         } else {
             lg.put(k, st)
@@ -174,8 +301,12 @@ object Core {
             } else if (st != "taken" && prev == "taken") {
                 delta = -1
             }
+            if (prev != st) {
+                act = if (st == "") "undo" else st
+            }
         }
         sp(c).edit().putString("log", lg.toString()).apply()
+        if (act != "") addEvent(c, id, t, act)
         val m = med(c, id) ?: return
         val stock = m.optInt("stock", -1)
         if (delta != 0 && stock >= 0) {
@@ -216,6 +347,7 @@ object Core {
         }
     }
     fun snooze(c: Context, id: String, t: String, minutes: Int = 10) {
+        addEvent(c, id, t, "snoozed")
         val am = c.getSystemService(AlarmManager::class.java)
         val p = PendingIntent.getBroadcast(
             c, 0,
@@ -355,7 +487,8 @@ object Core {
     // ---- backup ----
     fun exportJson(c: Context): String = JSONObject().put("app", "PillPal").put("version", 2)
         .put("meds", JSONArray(sp(c).getString("meds", "[]")))
-        .put("log", JSONObject(sp(c).getString("log", "{}"))).toString(2)
+        .put("log", JSONObject(sp(c).getString("log", "{}")))
+        .put("events", JSONArray(sp(c).getString("events", "[]"))).toString(2)
     fun importJson(c: Context, txt: String): Int {
         val o = JSONObject(txt)
         val a = o.getJSONArray("meds")
@@ -364,7 +497,8 @@ object Core {
             m.getString("id"); m.getString("name"); m.getJSONArray("times"); m.getJSONArray("days")
         }
         meds(c).forEach { cancelAll(c, it) }
-        sp(c).edit().putString("meds", a.toString()).putString("log", (o.optJSONObject("log") ?: JSONObject()).toString()).apply()
+        sp(c).edit().putString("meds", a.toString()).putString("log", (o.optJSONObject("log") ?: JSONObject()).toString())
+            .putString("events", (o.optJSONArray("events") ?: JSONArray()).toString()).apply()
         scheduleAll(c)
         return a.length()
     }
@@ -492,6 +626,12 @@ class MainActivity : Activity() {
     private var host: LinearLayout? = null
     private var query = ""
     private var navShown = -1
+    private var showLog = false
+    private var logFilter = "all"
+    private var logQuery = ""
+    private var aiSel: MutableSet<String> = mutableSetOf()
+    private var aiEditIdx = -1
+    private var pendingPass: String? = null
 
     // ---------- theme ----------
     private fun c(s: String) = Color.parseColor(s)
@@ -694,6 +834,20 @@ class MainActivity : Activity() {
         outState.putInt("tab", tab)
     }
 
+    @Suppress("DEPRECATION")
+    override fun onBackPressed() {
+        if (showLog) {
+            showLog = false
+            show()
+        } else if (editing != null) {
+            editing = null
+            aiEditIdx = -1
+            show()
+        } else {
+            super.onBackPressed()
+        }
+    }
+
     private fun show() {
         box.removeAllViews()
         renderTab()
@@ -703,7 +857,11 @@ class MainActivity : Activity() {
     private fun renderTab() {
         val e = editing
         if (tab == 0) {
-            today()
+            if (showLog) {
+                logScreen()
+            } else {
+                today()
+            }
         } else if (tab == 1) {
             if (e != null) {
                 form(e)
@@ -711,7 +869,11 @@ class MainActivity : Activity() {
                 medsList()
             }
         } else if (tab == 2) {
-            aiTab()
+            if (e != null && aiEditIdx >= 0) {
+                form(e)
+            } else {
+                aiTab()
+            }
         } else {
             settings()
         }
@@ -749,8 +911,10 @@ class MainActivity : Activity() {
                 }
             }
             item.setOnClickListener {
-                if (tab != i) {
+                if (tab != i || showLog || aiEditIdx >= 0) {
                     tab = i
+                    showLog = false
+                    aiEditIdx = -1
                     editing = null
                     scroll.scrollTo(0, 0)
                     box.alpha = 0f
@@ -763,6 +927,209 @@ class MainActivity : Activity() {
             nav.addView(item, params)
         }
         navShown = tab
+    }
+
+    // ---------- History ----------
+    private fun SpannableStringBuilder.part(t: String, color: Int, bold: Boolean = false): SpannableStringBuilder {
+        val st = length
+        append(t)
+        setSpan(ForegroundColorSpan(color), st, length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        if (bold) setSpan(StyleSpan(Typeface.BOLD), st, length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        return this
+    }
+    private fun fmtDayLabel(ts: Long): String {
+        val cal = Calendar.getInstance()
+        cal.timeInMillis = ts
+        val d = Core.ymd(cal)
+        val now = Calendar.getInstance()
+        if (d == Core.ymd(now)) return "Today"
+        now.add(Calendar.DAY_OF_YEAR, -1)
+        if (d == Core.ymd(now)) return "Yesterday"
+        return SimpleDateFormat("EEEE, d MMMM yyyy", Locale.getDefault()).format(Date(ts))
+    }
+    private fun fmtDur(mins: Int): String = if (mins >= 60) "${mins / 60}h ${mins % 60}m" else "${mins}m"
+    private fun timing(ts: Long, sched: String): String {
+        if (!Core.validHm(sched)) return ""
+        val cal = Calendar.getInstance()
+        cal.timeInMillis = ts
+        val d = cal.get(Calendar.HOUR_OF_DAY) * 60 + cal.get(Calendar.MINUTE) - Core.hm(sched)
+        if (d in -5..5) return " (on time)"
+        return if (d > 0) " (" + fmtDur(d) + " late)" else " (" + fmtDur(-d) + " early)"
+    }
+
+    private fun historyButton(): View {
+        val colr = p.gold
+        val v = object : View(this) {
+            override fun onDraw(canvas: Canvas) {
+                super.onDraw(canvas)
+                val w = width.toFloat()
+                val h = height.toFloat()
+                val cx = w / 2
+                val cy = h / 2
+                val r = minOf(w, h) * 0.30f
+                val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+                paint.style = Paint.Style.STROKE
+                paint.strokeWidth = dp(2).toFloat()
+                paint.strokeCap = Paint.Cap.ROUND
+                paint.color = colr
+                canvas.drawCircle(cx, cy, r, paint)
+                canvas.drawLine(cx, cy, cx, cy - r * 0.6f, paint)
+                canvas.drawLine(cx, cy, cx + r * 0.45f, cy + r * 0.25f, paint)
+            }
+        }
+        v.background = bg(p.hi, 22f, p.gold, 1)
+        v.contentDescription = "History"
+        v.setOnClickListener {
+            showLog = true
+            scroll.scrollTo(0, 0)
+            show()
+        }
+        return v
+    }
+
+    private fun penButton(f: () -> Unit): View {
+        val colr = p.gold
+        val v = object : View(this) {
+            override fun onDraw(canvas: Canvas) {
+                super.onDraw(canvas)
+                val w = width.toFloat()
+                val h = height.toFloat()
+                val a = minOf(w, h) * 0.24f
+                val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+                paint.style = Paint.Style.STROKE
+                paint.strokeCap = Paint.Cap.ROUND
+                paint.color = colr
+                paint.strokeWidth = dp(3).toFloat()
+                canvas.drawLine(w / 2 - a, h / 2 + a * 0.6f, w / 2 + a, h / 2 - a * 0.9f, paint)
+                paint.strokeWidth = dp(2).toFloat()
+                canvas.drawLine(w / 2 - a * 1.3f, h / 2 + a * 1.4f, w / 2 + a * 0.2f, h / 2 + a * 1.4f, paint)
+            }
+        }
+        v.background = bg(p.hi, 20f, p.gold, 1)
+        v.contentDescription = "Edit"
+        v.setOnClickListener { f() }
+        return v
+    }
+
+    private fun logLine(e: JSONObject, col: Int): View {
+        val ts = e.getLong("ts")
+        val act = e.optString("act")
+        val sc = e.optString("sched")
+        val sb = SpannableStringBuilder()
+        sb.part("●  ", col)
+        sb.part(SimpleDateFormat("h:mm a", Locale.getDefault()).format(Date(ts)), p.time, true)
+        sb.part("   ", p.mut)
+        if (act == "taken") {
+            sb.part("✓ Taken", p.ok, true)
+        } else if (act == "skipped") {
+            sb.part("✕ Skipped", p.bad, true)
+        } else if (act == "snoozed") {
+            sb.part("Snoozed", p.gold, true)
+        } else {
+            sb.part("Undone", p.mut, true)
+        }
+        sb.part("   ", p.mut)
+        sb.part(e.optString("name"), p.ink, true)
+        if (e.optString("dose") != "") sb.part("  " + e.optString("dose"), col)
+        val info = if (sc == "~") "repeating" else "due " + Core.fmt12(sc) + (if (act == "taken") timing(ts, sc) else "")
+        sb.part("   ·   " + info, p.mut)
+        val t = TextView(this)
+        t.text = sb
+        t.textSize = 13f
+        t.maxLines = 1
+        t.ellipsize = TextUtils.TruncateAt.END
+        t.setPadding(0, dp(10), 0, dp(10))
+        return t
+    }
+
+    private fun logScreen() {
+        val hdr = LinearLayout(this)
+        hdr.gravity = Gravity.CENTER_VERTICAL
+        val col = LinearLayout(this)
+        col.orientation = LinearLayout.VERTICAL
+        col.addView(tx("History", 32f, p.ink, bold = true, serif = true))
+        col.addView(tx("Every dose you logged", 14f, p.mut, italic = true, serif = true))
+        hdr.addView(col, LinearLayout.LayoutParams(0, -2, 1f))
+        hdr.addView(pill("Close", false) {
+            showLog = false
+            scroll.scrollTo(0, 0)
+            show()
+        })
+        box.addView(hdr)
+        box.addView(ornament(), lp(-1, -2, 0, 6, 0, 8))
+        val search = field("Search medicine, status, day...", logQuery)
+        search.background = bg(p.card, 22f, p.line, 1)
+        search.isSingleLine = true
+        search.setCompoundDrawablesRelativeWithIntrinsicBounds(icon(R.drawable.ic_search, p.mut), null, null, null)
+        search.compoundDrawablePadding = dp(10)
+        box.addView(search, lp(-1, -2, 0, 0, 0, 6))
+        val filters = LinearLayout(this)
+        for ((k, n) in listOf("all" to "All", "taken" to "Taken", "skipped" to "Skipped")) {
+            filters.addView(pill(n, logFilter == k) {
+                logFilter = k
+                show()
+            }, lp(-2, -2, 0, 0, 8, 0))
+        }
+        box.addView(filters, lp(-1, -2, 0, 0, 0, 6))
+        val list = LinearLayout(this)
+        list.orientation = LinearLayout.VERTICAL
+        box.addView(list)
+
+        fun fill() {
+            list.removeAllViews()
+            host = list
+            val q = logQuery.lowercase().split(" ").filter { it.isNotBlank() }
+            val colors = HashMap<String, Int>()
+            Core.meds(this).forEach { colors[it.getString("id")] = colorFor(it) }
+            val ev = Core.events(this).reversed().filter { e ->
+                val act = e.optString("act")
+                val hay = (e.optString("name") + " " + e.optString("dose") + " " + act + " " + fmtDayLabel(e.getLong("ts"))).lowercase()
+                (logFilter == "all" || act == logFilter) && q.all { hay.contains(it) }
+            }
+            if (ev.isEmpty()) {
+                addCard(p.gold) {
+                    addView(tx("Nothing here yet", 18f, p.ink, bold = true, serif = true))
+                    addView(tx("Doses you mark as taken or skipped appear here with the time you tapped.", 14f, p.mut))
+                }
+            } else {
+                val tk = ev.count { it.optString("act") == "taken" }
+                val sk = ev.count { it.optString("act") == "skipped" }
+                addCard(p.time) {
+                    addView(tx("Taken $tk · Skipped $sk · ${ev.size} entries", 15f, p.mut, italic = true, serif = true))
+                }
+                val groups = ev.groupBy { fmtDayLabel(it.getLong("ts")) }
+                for ((day, items) in groups) {
+                    addCard(p.gold) {
+                        addView(tx(day, 15f, p.gold, bold = true, serif = true))
+                        items.forEachIndexed { k, e ->
+                            if (k > 0) addView(View(context).apply { setBackgroundColor(p.line) }, LinearLayout.LayoutParams(-1, dp(1)))
+                            addView(logLine(e, colors[e.getString("id")] ?: medColor(e.getString("id"))))
+                        }
+                    }
+                }
+            }
+            host = null
+        }
+        fill()
+        search.addTextChangedListener(object : TextWatcher {
+            override fun afterTextChanged(s: Editable?) {
+                logQuery = s?.toString() ?: ""
+                fill()
+            }
+            override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+            override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+        })
+        if (Core.events(this).isNotEmpty()) {
+            box.addView(btn("Clear history", p.bad, p.bad, true) {
+                AlertDialog.Builder(this).setTitle("Clear history?")
+                    .setMessage("This removes the log of doses. Your medicines are not affected.")
+                    .setPositiveButton("Clear") { _, _ ->
+                        Core.clearEvents(this)
+                        show()
+                    }
+                    .setNegativeButton("Cancel", null).show()
+            }, lp(-2, -2, 0, 16, 0, 0))
+        }
     }
 
     // ---------- Today ----------
@@ -786,7 +1153,16 @@ class MainActivity : Activity() {
 
     private fun today() {
         val now = Calendar.getInstance()
-        heading("Today", SimpleDateFormat("EEEE, d MMMM", Locale.getDefault()).format(now.time))
+        val hdr = LinearLayout(this)
+        hdr.gravity = Gravity.CENTER_VERTICAL
+        val hcol = LinearLayout(this)
+        hcol.orientation = LinearLayout.VERTICAL
+        hcol.addView(tx("Today", 32f, p.ink, bold = true, serif = true))
+        hcol.addView(tx(SimpleDateFormat("EEEE, d MMMM", Locale.getDefault()).format(now.time), 14f, p.mut, italic = true, serif = true))
+        hdr.addView(hcol, LinearLayout.LayoutParams(0, -2, 1f))
+        hdr.addView(historyButton(), LinearLayout.LayoutParams(dp(46), dp(46)))
+        box.addView(hdr)
+        box.addView(ornament(), lp(-1, -2, 0, 6, 0, 8))
         val search = field("Search name, dose, time, notes...", query)
         search.background = bg(p.card, 22f, p.line, 1)
         search.isSingleLine = true
@@ -1123,7 +1499,7 @@ class MainActivity : Activity() {
     private fun form(m: JSONObject) {
         val isNew = m.optBoolean("isNew")
         val mode = Core.mode(m)
-        heading(if (isNew) "New medicine" else "Edit medicine", "Fill in the details")
+        heading(if (aiEditIdx >= 0) "Edit before adding" else if (isNew) "New medicine" else "Edit medicine", "Fill in the details")
         val name = field("e.g. Metformin", m.getString("name"))
         val dose = field("e.g. 500 mg", m.optString("dose"))
         val per = field("1", m.optInt("per", 1).toString())
@@ -1344,8 +1720,15 @@ class MainActivity : Activity() {
                 toast(err)
             } else {
                 val doSave = {
-                    m.remove("isNew")
-                    Core.upsert(this@MainActivity, m)
+                    if (aiEditIdx >= 0) {
+                        val l = ai.toMutableList()
+                        l[aiEditIdx] = m
+                        ai = l
+                        aiEditIdx = -1
+                    } else {
+                        m.remove("isNew")
+                        Core.upsert(this@MainActivity, m)
+                    }
                     editing = null
                     show()
                 }
@@ -1359,9 +1742,9 @@ class MainActivity : Activity() {
                 }
             }
         }
-        val cancelB = btn("Cancel", p.mut, p.mut, true) { editing = null; show() }
+        val cancelB = btn("Cancel", p.mut, p.mut, true) { editing = null; aiEditIdx = -1; show() }
         val items = mutableListOf<Button>(saveB, cancelB)
-        if (!isNew) {
+        if (!isNew && aiEditIdx < 0) {
             items.add(btn("Duplicate", p.gold, p.gold, true) {
                 collect()
                 val cp = JSONObject(m.toString())
@@ -1389,17 +1772,32 @@ class MainActivity : Activity() {
     // ---------- Ask AI ----------
     private fun aiTab() {
         heading("Ask AI", "Describe it, and the scribe fills the schedule")
+        addCard(p.bad) {
+            addView(tx("Double-check before adding", 16f, p.bad, bold = true, serif = true))
+            addView(tx("AI can make mistakes. Always verify names, doses and timings against your prescription, or with your doctor or pharmacist, before adding anything.", 13f, p.ink))
+        }
         val q = field("e.g. Amoxicillin 500mg every 8 hours for 5 days", aiText, 4)
         addCard(p.gold) {
-            addView(tx("Fixed times, every few minutes or hours, every other day, on/off cycles, or as needed. You can also paste prescription text.", 14f, p.mut, italic = true, serif = true))
+            addView(tx("Fixed times, repeating intervals, every other day, on/off cycles or as needed. You can also paste prescription text.", 13f, p.mut, italic = true, serif = true))
             addView(q, lp(-1, -2, 0, 8, 0, 0))
             addView(btn("Create with AI", p.gold, p.onAcc) { runAI(q.text.toString()) }, lp(-2, -2, 0, 10, 0, 0))
             if (aiMsg != "") addView(tx(aiMsg, 14f, p.time, italic = true, serif = true), lp(-2, -2, 0, 8, 0, 0))
         }
-        ai.forEach { m ->
+        ai.forEachIndexed { i, m ->
+            val id = m.getString("id")
             val col = colorFor(m)
-            addCard(col) {
-                addView(tx(m.getString("name"), 18f, p.ink, bold = true, serif = true))
+            val on = aiSel.contains(id)
+            addCard(col, on) {
+                val top = LinearLayout(context)
+                top.gravity = Gravity.CENTER_VERTICAL
+                top.addView(tx(m.getString("name"), 18f, p.ink, bold = true, serif = true), LinearLayout.LayoutParams(0, -2, 1f))
+                top.addView(penButton {
+                    editing = JSONObject(m.toString())
+                    aiEditIdx = i
+                    scroll.scrollTo(0, 0)
+                    show()
+                }, LinearLayout.LayoutParams(dp(38), dp(38)))
+                addView(top)
                 if (m.optString("dose") != "") addView(tx(m.optString("dose"), 15f, col, bold = true))
                 addView(tx(describe(m), 14f, p.time))
                 if (m.optString("end") != "") addView(tx("Until " + m.optString("end"), 13f, p.mut, italic = true, serif = true))
@@ -1407,36 +1805,76 @@ class MainActivity : Activity() {
                 if (m.optString("notes") != "") addView(tx(m.optString("notes"), 14f, p.mut, italic = true, serif = true))
                 val w = Core.warn(m)
                 if (w != null) addView(tx(w, 13f, p.bad, italic = true, serif = true))
+                val r = LinearLayout(context)
+                r.addView(pill(if (on) "✓ Included" else "Not included", on) {
+                    if (on) aiSel.remove(id) else aiSel.add(id)
+                    show()
+                }, lp(-2, -2, 0, 10, 8, 0))
+                r.addView(pill("Add this one", false) { addAi(listOf(m)) }, lp(-2, -2, 0, 10, 0, 0))
+                addView(r)
             }
         }
         if (ai.isNotEmpty()) {
+            val n = ai.count { aiSel.contains(it.getString("id")) }
             val r = LinearLayout(this)
-            r.addView(btn("Save all ${ai.size}", p.ok, p.onAcc) {
-                ai.forEach { Core.upsert(this, it) }
-                ai = emptyList()
-                aiMsg = "Saved."
-                aiText = ""
-                tab = 0
-                show()
+            r.addView(btn("Add selected ($n)", p.ok, p.onAcc) {
+                addAi(ai.filter { aiSel.contains(it.getString("id")) })
             }, lp(-2, -2, 0, 6, 8, 0))
-            r.addView(btn("Discard", p.mut, p.mut, true) { ai = emptyList(); aiMsg = ""; show() }, lp(-2, -2, 0, 6, 0, 0))
+            r.addView(btn("Add all", p.gold, p.gold, true) { addAi(ai) }, lp(-2, -2, 0, 6, 0, 0))
             box.addView(r)
+            box.addView(btn("Discard all", p.mut, p.mut, true) {
+                ai = emptyList()
+                aiSel = mutableSetOf()
+                aiMsg = ""
+                show()
+            }, lp(-2, -2, 0, 8, 0, 0))
         }
+    }
+
+    private fun addAi(items: List<JSONObject>) {
+        if (items.isEmpty()) {
+            toast("Select at least one medicine")
+            return
+        }
+        val ids = items.map { it.getString("id") }
+        items.forEach { Core.upsert(this, it) }
+        ai = ai.filter { it.getString("id") !in ids }
+        ids.forEach { aiSel.remove(it) }
+        aiMsg = "Added " + items.size + (if (items.size == 1) " medicine." else " medicines.")
+        if (ai.isEmpty()) {
+            aiText = ""
+            tab = 0
+        }
+        show()
     }
 
     private fun runAI(q: String) {
         aiText = q
-        val key = Core.sp(this).getString("key", "") ?: ""
+        val key = Core.getKey(this)
         val model = Core.sp(this).getString("model", "gemini-3.5-flash-lite") ?: "gemini-3.5-flash-lite"
-        if (key.isEmpty()) { aiMsg = "Add your Gemini API key in Settings first."; show(); return }
+        if (key.isEmpty()) {
+            aiMsg = "Add your Gemini API key in Settings first."
+            show()
+            return
+        }
         if (q.isBlank()) return
-        aiMsg = "Consulting the scribe..."; show()
+        aiMsg = "Reading your text..."
+        show()
         thread {
             try {
                 val r = Core.ask(key, model, q)
-                runOnUiThread { ai = r; aiMsg = if (r.isEmpty()) "No medicines found." else "Check the result, then save."; show() }
+                runOnUiThread {
+                    ai = r
+                    aiSel = r.map { it.getString("id") }.toMutableSet()
+                    aiMsg = if (r.isEmpty()) "No medicines found." else "Review each entry, edit with the pencil if needed, then add."
+                    show()
+                }
             } catch (e: Exception) {
-                runOnUiThread { ai = emptyList(); aiMsg = "Error: " + e.message; show() }
+                runOnUiThread {
+                    ai = emptyList()
+                    aiMsg = "Error: " + e.message
+                    show()
+                }
             }
         }
     }
@@ -1459,7 +1897,7 @@ class MainActivity : Activity() {
             }
             addView(r)
         }
-        val key = field("AIza...", sp.getString("key", "") ?: "")
+        val key = field("AIza...", Core.getKey(this))
         key.transformationMethod = PasswordTransformationMethod.getInstance()
         val model = field("Model", sp.getString("model", "gemini-3.5-flash-lite") ?: "gemini-3.5-flash-lite")
         var shown = false
@@ -1479,13 +1917,13 @@ class MainActivity : Activity() {
             hdr.addView(tx("Gemini API", 18f, p.ink, bold = true, serif = true), LinearLayout.LayoutParams(0, -2, 1f))
             hdr.addView(help, LinearLayout.LayoutParams(dp(36), dp(36)))
             addView(hdr)
-            addView(tx("Tap ? for a step by step guide to get your key", 13f, p.mut, italic = true, serif = true))
+            addView(tx("Stored encrypted on this device. Tap ? for a setup guide.", 13f, p.mut, italic = true, serif = true))
             addView(key, lp(-1, -2, 0, 6, 0, 0))
             addView(tog, lp(-2, -2, 0, 6, 0, 0))
             addView(model, lp(-1, -2, 0, 6, 0, 0))
             addView(btn("Save", p.gold, p.onAcc) {
-                sp.edit().putString("key", key.text.toString().trim())
-                    .putString("model", model.text.toString().trim().ifEmpty { "gemini-3.5-flash-lite" }).apply()
+                Core.setKey(this@MainActivity, key.text.toString().trim())
+                sp.edit().putString("model", model.text.toString().trim().ifEmpty { "gemini-3.5-flash-lite" }).apply()
                 toast("Saved")
             }, lp(-2, -2, 0, 10, 0, 0))
         }
@@ -1508,7 +1946,7 @@ class MainActivity : Activity() {
         }
         addCard(p.bad) {
             addView(tx("Backup", 18f, p.ink, bold = true, serif = true))
-            addView(tx("Saves your medicines and history to a file. Your API key is not included.", 13f, p.mut, italic = true, serif = true))
+            addView(tx("Export your medicines and history to a file, optionally protected with a password (AES-256). Your API key is never included.", 13f, p.mut, italic = true, serif = true))
             val r = LinearLayout(context)
             r.addView(btn("Export", p.gold, p.onAcc) { exportBackup() }, lp(-2, -2, 0, 10, 8, 0))
             r.addView(btn("Import", p.gold, p.gold, true) { importBackup() }, lp(-2, -2, 0, 10, 0, 0))
@@ -1517,22 +1955,52 @@ class MainActivity : Activity() {
         addCard(p.gold, true) {
             addView(tx("About PillPal", 18f, p.ink, bold = true, serif = true))
             addView(tx("Made with ♥ by @abdulwajid2840", 16f, p.gold, bold = true, serif = true))
-            addView(tx("Built on a phone, with Gemini helping to read schedules.", 13f, p.mut, italic = true, serif = true))
+            addView(tx("PillPal 1.0 · Private, safe and lightweight medication reminders. Your data stays on your device.", 13f, p.mut, italic = true, serif = true))
             addView(btn("Visit my GitHub", p.gold, p.onAcc) { openUrl(GITHUB_PROFILE) }, lp(-2, -2, 0, 10, 0, 0))
             addView(btn("Setup guide", p.gold, p.gold, true) { openUrl(GITHUB_HELP) }, lp(-2, -2, 0, 8, 0, 0))
         }
     }
 
     // ---------- Backup ----------
+    private fun askPass(title: String, msg: String, ok: String, onOk: (String) -> Unit) {
+        val et = EditText(this)
+        et.hint = "Password"
+        et.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+        et.setPadding(dp(20), dp(12), dp(20), dp(12))
+        AlertDialog.Builder(this).setTitle(title).setMessage(msg).setView(et)
+            .setPositiveButton(ok) { _, _ -> onOk(et.text.toString()) }
+            .setNegativeButton("Cancel", null).show()
+    }
     private fun exportBackup() {
-        val name = "pillpal-backup-" + Core.ymd(Calendar.getInstance()) + ".json"
-        startActivityForResult(
-            Intent(Intent.ACTION_CREATE_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE)
-                .setType("application/json").putExtra(Intent.EXTRA_TITLE, name), 101
-        )
+        askPass(
+            "Protect your backup",
+            "Set a password to encrypt this backup with AES-256. You will need it to restore. Leave it empty to save an unencrypted file.",
+            "Continue"
+        ) { pw ->
+            pendingPass = pw
+            val name = "pillpal-backup-" + Core.ymd(Calendar.getInstance()) + (if (pw.isEmpty()) ".json" else ".enc.json")
+            startActivityForResult(
+                Intent(Intent.ACTION_CREATE_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE)
+                    .setType("application/json").putExtra(Intent.EXTRA_TITLE, name), 101
+            )
+        }
     }
     private fun importBackup() {
         startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*"), 102)
+    }
+    private fun confirmImport(txt: String) {
+        AlertDialog.Builder(this).setTitle("Import backup?")
+            .setMessage("This replaces your current medicines and history.")
+            .setPositiveButton("Import") { _, _ ->
+                try {
+                    val n = Core.importJson(this, txt)
+                    toast("Imported $n medicines")
+                    show()
+                } catch (e: Exception) {
+                    toast("Not a valid backup: " + e.message)
+                }
+            }
+            .setNegativeButton("Cancel", null).show()
     }
     @Suppress("DEPRECATION")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
@@ -1541,18 +2009,29 @@ class MainActivity : Activity() {
         if (resultCode != RESULT_OK) return
         try {
             if (requestCode == 101) {
-                contentResolver.openOutputStream(uri)?.use { it.write(Core.exportJson(this).toByteArray()) }
-                toast("Backup saved")
+                val plain = Core.exportJson(this)
+                val pw = pendingPass ?: ""
+                pendingPass = null
+                val out = if (pw.isEmpty()) plain else Crypto.encryptWithPassword(plain, pw)
+                contentResolver.openOutputStream(uri)?.use { it.write(out.toByteArray(Charsets.UTF_8)) }
+                toast(if (pw.isEmpty()) "Backup saved" else "Encrypted backup saved")
             } else if (requestCode == 102) {
                 val txt = contentResolver.openInputStream(uri)?.bufferedReader()?.readText() ?: ""
-                AlertDialog.Builder(this).setTitle("Import backup?")
-                    .setMessage("This replaces your current medicines and history.")
-                    .setPositiveButton("Import") { _, _ ->
-                        try { val n = Core.importJson(this, txt); toast("Imported $n medicines"); show() }
-                        catch (e: Exception) { toast("Not a valid backup: " + e.message) }
+                val encrypted = runCatching { JSONObject(txt).has("enc") }.getOrDefault(false)
+                if (encrypted) {
+                    askPass("Encrypted backup", "Enter the password used when this backup was created.", "Unlock") { pw ->
+                        try {
+                            confirmImport(Crypto.decryptWithPassword(txt, pw))
+                        } catch (e: Exception) {
+                            toast("Wrong password or damaged file")
+                        }
                     }
-                    .setNegativeButton("Cancel", null).show()
+                } else {
+                    confirmImport(txt)
+                }
             }
-        } catch (e: Exception) { toast("Failed: " + e.message) }
+        } catch (e: Exception) {
+            toast("Failed: " + e.message)
+        }
     }
 }
