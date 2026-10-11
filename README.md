@@ -1,3 +1,12 @@
+<p align="center">
+  <img width="1080" height="3429" alt="Screenshot_2026-10-12-01-26-13-025_com jaby pillpal" src="https://github.com/user-attachments/assets/8dc7e324-eaa5-4e64-b783-f6722f1d7016" />
+  <img width="1080" height="3141" alt="Screenshot_2026-10-12-01-26-44-548_com jaby pillpal" src="https://github.com/user-attachments/assets/059b33a3-8e1a-4c4d-ba69-a7e8c57b05e9" />
+  <img width="1080" height="2400" alt="Screenshot_2026-10-12-01-27-14-573_com jaby pillpal" src="https://github.com/user-attachments/assets/49c80ad0-7b40-4dd0-a4fa-8043e103aec7" />
+  <img width="1080" height="3460" alt="Screenshot_2026-10-12-01-27-18-138_com jaby pillpal" src="https://github.com/user-attachments/assets/a33a14bf-b38a-4aa9-9758-84997618c370" />
+  <img width="1080" height="2400" alt="Screenshot_2026-10-12-01-27-33-286_com jaby pillpal" src="https://github.com/user-attachments/assets/22ca1b70-be72-4985-b84a-1c73d12c05fd" />
+  <img width="1080" height="4688" alt="Screenshot_2026-10-12-01-28-19-334_com jaby pillpal" src="https://github.com/user-attachments/assets/6d263ae0-535f-4e9c-b941-aeeb497bf390" />
+</p>
+
 # PillPal
 
 **Private, safe and lightweight medication reminders for Android.**
