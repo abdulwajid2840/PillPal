@@ -1,4 +1,4 @@
-##ScreenShots
+# Screenshots
 
 <p align="center">
   <img width="1080" height="3429" alt="Screenshot_2026-10-12-01-26-13-025_com jaby pillpal" src="https://github.com/user-attachments/assets/8dc7e324-eaa5-4e64-b783-f6722f1d7016" />
