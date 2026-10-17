@@ -28,6 +28,8 @@ import android.text.Editable
 import android.text.TextWatcher
 import android.text.method.PasswordTransformationMethod
 import android.widget.ImageView
+import android.widget.Switch
+import android.graphics.RectF
 import android.graphics.Canvas
 import android.graphics.Paint
 import android.security.keystore.KeyGenParameterSpec
@@ -269,6 +271,15 @@ object Core {
         }
         sp(c).edit().putString("events", out.toString()).apply()
     }
+    fun temps(c: Context): List<JSONObject> {
+        val a = JSONArray(sp(c).getString("temps", "[]"))
+        return List(a.length()) { a.getJSONObject(it) }.sortedBy { it.getLong("ts") }
+    }
+    fun saveTemps(c: Context, l: List<JSONObject>) {
+        val a = JSONArray()
+        l.sortedBy { it.getLong("ts") }.forEach { a.put(it) }
+        sp(c).edit().putString("temps", a.toString()).apply()
+    }
     fun events(c: Context): List<JSONObject> {
         val a = JSONArray(sp(c).getString("events", "[]"))
         return List(a.length()) { a.getJSONObject(it) }
@@ -488,7 +499,8 @@ object Core {
     fun exportJson(c: Context): String = JSONObject().put("app", "PillPal").put("version", 2)
         .put("meds", JSONArray(sp(c).getString("meds", "[]")))
         .put("log", JSONObject(sp(c).getString("log", "{}")))
-        .put("events", JSONArray(sp(c).getString("events", "[]"))).toString(2)
+        .put("events", JSONArray(sp(c).getString("events", "[]")))
+        .put("temps", JSONArray(sp(c).getString("temps", "[]"))).toString(2)
     fun importJson(c: Context, txt: String): Int {
         val o = JSONObject(txt)
         val a = o.getJSONArray("meds")
@@ -498,7 +510,8 @@ object Core {
         }
         meds(c).forEach { cancelAll(c, it) }
         sp(c).edit().putString("meds", a.toString()).putString("log", (o.optJSONObject("log") ?: JSONObject()).toString())
-            .putString("events", (o.optJSONArray("events") ?: JSONArray()).toString()).apply()
+            .putString("events", (o.optJSONArray("events") ?: JSONArray()).toString())
+            .putString("temps", (o.optJSONArray("temps") ?: JSONArray()).toString()).apply()
         scheduleAll(c)
         return a.length()
     }
@@ -608,6 +621,95 @@ class BootReceiver : BroadcastReceiver() {
 }
 
 /* ---------------- UI ---------------- */
+class TempChart(
+    ctx: Context,
+    private val oral: List<Double?>,
+    private val axi: List<Double?>,
+    private val labels: List<String>,
+    private val fahrenheit: Boolean,
+    private val cOral: Int,
+    private val cAxi: Int,
+    private val cText: Int,
+    private val cLine: Int,
+    private val cBand: Int
+) : View(ctx) {
+    private val d = ctx.resources.displayMetrics.density
+    private fun u(c: Double) = if (fahrenheit) c * 9 / 5 + 32 else c
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        val n = oral.size
+        val vals = (oral + axi).filterNotNull()
+        if (n == 0 || vals.isEmpty()) return
+        val w = width.toFloat()
+        val h = height.toFloat()
+        val l = 42f * d
+        val r = 12f * d
+        val t = 12f * d
+        val b = 28f * d
+        val lo = minOf(vals.minOrNull() ?: 36.0, 35.0) - 0.4
+        val hi = maxOf(vals.maxOrNull() ?: 38.0, 38.5) + 0.4
+        fun yOf(c: Double): Float = t + (h - t - b) * (1.0 - (c - lo) / (hi - lo)).toFloat()
+        fun xOf(i: Int): Float = if (n == 1) (l + w - r) / 2f else l + (w - l - r) * i / (n - 1)
+
+        val band = Paint(Paint.ANTI_ALIAS_FLAG)
+        band.color = cBand
+        canvas.drawRect(l, yOf(37.5), w - r, yOf(35.5), band)
+
+        val gp = Paint(Paint.ANTI_ALIAS_FLAG)
+        gp.color = cLine
+        gp.strokeWidth = d
+        val tp = Paint(Paint.ANTI_ALIAS_FLAG)
+        tp.color = cText
+        tp.textSize = 10f * d
+        tp.textAlign = Paint.Align.RIGHT
+        val step = if (fahrenheit) 2.0 else 1.0
+        var v = Math.ceil(u(lo) / step) * step
+        val vmax = Math.floor(u(hi))
+        while (v <= vmax) {
+            val c = if (fahrenheit) (v - 32) * 5 / 9 else v
+            val y = yOf(c)
+            canvas.drawLine(l, y, w - r, y, gp)
+            canvas.drawText(String.format(Locale.US, "%.0f", v), l - 6f * d, y + 3.5f * d, tp)
+            v += step
+        }
+
+        fun series(vs: List<Double?>, col: Int) {
+            val lineP = Paint(Paint.ANTI_ALIAS_FLAG)
+            lineP.color = col
+            lineP.strokeWidth = 2f * d
+            lineP.style = Paint.Style.STROKE
+            lineP.strokeCap = Paint.Cap.ROUND
+            val dotP = Paint(Paint.ANTI_ALIAS_FLAG)
+            dotP.color = col
+            var px = -1f
+            var py = -1f
+            for (i in vs.indices) {
+                val c = vs[i] ?: continue
+                val x = xOf(i)
+                val y = yOf(c)
+                if (px >= 0f) canvas.drawLine(px, py, x, y, lineP)
+                px = x
+                py = y
+            }
+            for (i in vs.indices) {
+                val c = vs[i] ?: continue
+                canvas.drawCircle(xOf(i), yOf(c), 4f * d, dotP)
+            }
+        }
+        series(oral, cOral)
+        series(axi, cAxi)
+
+        tp.textSize = 9f * d
+        tp.textAlign = Paint.Align.LEFT
+        canvas.drawText(labels.first(), l, h - 8f * d, tp)
+        if (labels.size > 1) {
+            tp.textAlign = Paint.Align.RIGHT
+            canvas.drawText(labels.last(), w - r, h - 8f * d, tp)
+        }
+    }
+}
+
 class Pal(
     val dark: Boolean, val bg: Int, val card: Int, val ink: Int, val mut: Int, val gold: Int,
     val ok: Int, val bad: Int, val time: Int, val line: Int, val hi: Int, val onAcc: Int
@@ -627,6 +729,7 @@ class MainActivity : Activity() {
     private var query = ""
     private var navShown = -1
     private var showLog = false
+    private var showTemp = false
     private var logFilter = "all"
     private var logQuery = ""
     private var aiSel: MutableSet<String> = mutableSetOf()
@@ -839,6 +942,9 @@ class MainActivity : Activity() {
         if (showLog) {
             showLog = false
             show()
+        } else if (showTemp) {
+            showTemp = false
+            show()
         } else if (editing != null) {
             editing = null
             aiEditIdx = -1
@@ -859,6 +965,8 @@ class MainActivity : Activity() {
         if (tab == 0) {
             if (showLog) {
                 logScreen()
+            } else if (showTemp) {
+                tempScreen()
             } else {
                 today()
             }
@@ -911,9 +1019,10 @@ class MainActivity : Activity() {
                 }
             }
             item.setOnClickListener {
-                if (tab != i || showLog || aiEditIdx >= 0) {
+                if (tab != i || showLog || showTemp || aiEditIdx >= 0) {
                     tab = i
                     showLog = false
+                    showTemp = false
                     aiEditIdx = -1
                     editing = null
                     scroll.scrollTo(0, 0)
@@ -1132,6 +1241,285 @@ class MainActivity : Activity() {
         }
     }
 
+    // ---------- Temperature ----------
+    private fun tUnitF(): Boolean = Core.sp(this).getString("tunit", "F") == "F"
+    private fun tHl(): Boolean = Core.sp(this).getBoolean("thl", true)
+    private fun fmtNum(cc: Double, f: Boolean): String = String.format(Locale.US, "%.1f", if (f) cc * 9 / 5 + 32 else cc)
+    private fun fmtT(cc: Double, f: Boolean): String = fmtNum(cc, f) + (if (f) "°F" else "°C")
+    private fun tempLevel(site: String, cc: Double): Int {
+        val v = if (site == "axi") cc + 0.5 else cc
+        return if (v < 35.5) 0 else if (v <= 37.5) 1 else if (v < 38.0) 2 else if (v < 39.5) 3 else 4
+    }
+    private fun levelColor(lv: Int): Int = when (lv) {
+        0 -> p.time
+        1 -> p.ok
+        2 -> p.gold
+        3 -> if (p.dark) c("#EE9B4D") else c("#C4651A")
+        else -> p.bad
+    }
+    private fun levelName(lv: Int): String = listOf("Low", "Normal", "Elevated", "Fever", "High fever")[lv]
+
+    private fun thermButton(): View {
+        val colr = p.gold
+        val v = object : View(this) {
+            override fun onDraw(canvas: Canvas) {
+                super.onDraw(canvas)
+                val w = width.toFloat()
+                val h = height.toFloat()
+                val cx = w / 2
+                val cy = h / 2
+                val sw = w * 0.085f
+                val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+                paint.color = colr
+                paint.strokeWidth = dp(2).toFloat()
+                paint.strokeCap = Paint.Cap.ROUND
+                paint.style = Paint.Style.STROKE
+                canvas.drawRoundRect(RectF(cx - sw, cy - h * 0.28f, cx + sw, cy + h * 0.12f), sw, sw, paint)
+                canvas.drawLine(cx, cy + h * 0.2f, cx, cy - h * 0.04f, paint)
+                paint.style = Paint.Style.FILL
+                canvas.drawCircle(cx, cy + h * 0.2f, w * 0.1f, paint)
+            }
+        }
+        v.background = bg(p.hi, 22f, p.gold, 1)
+        v.contentDescription = "Temperature log"
+        v.setOnClickListener {
+            showTemp = true
+            scroll.scrollTo(0, 0)
+            show()
+        }
+        return v
+    }
+
+    private fun tRow(a: View, b: View, c2: View): LinearLayout {
+        val r = LinearLayout(this)
+        r.gravity = Gravity.CENTER_VERTICAL
+        r.addView(a, lp(0, -2, 0, 0, 0, 0).apply { weight = 1.25f })
+        r.addView(b, lp(0, -2, 3, 3, 3, 3).apply { weight = 1f })
+        r.addView(c2, lp(0, -2, 3, 3, 3, 3).apply { weight = 1f })
+        return r
+    }
+    private fun hdrCell(s: String): TextView {
+        val t = tx(s, 11f, p.mut, bold = true)
+        t.gravity = Gravity.CENTER
+        return t
+    }
+    private fun tCell(site: String, cc: Double?, f: Boolean, hl: Boolean): View {
+        val t = tx(if (cc == null) "–" else fmtT(cc, f), 14f, p.mut)
+        t.gravity = Gravity.CENTER
+        t.setPadding(dp(4), dp(9), dp(4), dp(9))
+        if (cc != null) {
+            t.setTextColor(p.ink)
+            if (hl) {
+                val col = levelColor(tempLevel(site, cc))
+                t.setTextColor(col)
+                t.typeface = Typeface.create("sans-serif", Typeface.BOLD)
+                t.background = bg(withA(col, 0x2E), 10f)
+            }
+        }
+        return t
+    }
+
+    private fun tempDialog(existing: JSONObject?) {
+        val f = tUnitF()
+        var ts = existing?.getLong("ts") ?: System.currentTimeMillis()
+        val stampFmt = SimpleDateFormat("d MMM yyyy, h:mm a", Locale.getDefault())
+        val wrap = LinearLayout(this)
+        wrap.orientation = LinearLayout.VERTICAL
+        wrap.setPadding(dp(18), dp(16), dp(18), dp(8))
+        wrap.background = bg(p.card, 24f)
+        wrap.addView(tx(if (existing == null) "Add reading" else "Edit reading", 20f, p.ink, bold = true, serif = true))
+        val unit = if (f) "°F" else "°C"
+        val oral = field("e.g. " + (if (f) "98.6" else "37.0"), if (existing != null && existing.has("oral")) fmtNum(existing.getDouble("oral"), f) else "")
+        val axi = field("e.g. " + (if (f) "97.8" else "36.5"), if (existing != null && existing.has("axi")) fmtNum(existing.getDouble("axi"), f) else "")
+        for (e in listOf(oral, axi)) {
+            e.inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+            e.isSingleLine = true
+        }
+        wrap.addView(lab("ORAL ($unit)"))
+        wrap.addView(oral)
+        wrap.addView(lab("AXILLARY ($unit)"))
+        wrap.addView(axi)
+        wrap.addView(lab("TIME"))
+        val timeBtn = btn(stampFmt.format(Date(ts)), p.gold, p.gold, true) { }
+        timeBtn.setOnClickListener {
+            val cal = Calendar.getInstance()
+            cal.timeInMillis = ts
+            DatePickerDialog(
+                this,
+                { _, y, mo, d ->
+                    TimePickerDialog(
+                        this,
+                        { _, hh, mm ->
+                            val c2 = Calendar.getInstance()
+                            c2.set(y, mo, d, hh, mm, 0)
+                            ts = c2.timeInMillis
+                            timeBtn.text = stampFmt.format(Date(ts))
+                        },
+                        cal.get(Calendar.HOUR_OF_DAY), cal.get(Calendar.MINUTE), false
+                    ).show()
+                },
+                cal.get(Calendar.YEAR), cal.get(Calendar.MONTH), cal.get(Calendar.DAY_OF_MONTH)
+            ).show()
+        }
+        wrap.addView(timeBtn)
+        val b = AlertDialog.Builder(this).setView(wrap)
+            .setPositiveButton("Save", null)
+            .setNegativeButton("Cancel", null)
+        if (existing != null) b.setNeutralButton("Delete", null)
+        val dlg = b.create()
+        dlg.setOnShowListener {
+            dlg.window?.setBackgroundDrawable(bg(p.card, 24f))
+            for (k in listOf(AlertDialog.BUTTON_POSITIVE, AlertDialog.BUTTON_NEGATIVE, AlertDialog.BUTTON_NEUTRAL)) {
+                dlg.getButton(k)?.setTextColor(p.gold)
+            }
+            dlg.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val os = oral.text.toString().trim().replace(',', '.')
+                val asx = axi.text.toString().trim().replace(',', '.')
+                val ov = if (os.isEmpty()) null else os.toDoubleOrNull()
+                val av = if (asx.isEmpty()) null else asx.toDoubleOrNull()
+                if ((os.isNotEmpty() && ov == null) || (asx.isNotEmpty() && av == null)) {
+                    toast("Enter numbers like " + (if (f) "98.6" else "37.0"))
+                } else if (ov == null && av == null) {
+                    toast("Enter at least one reading")
+                } else {
+                    val oc = if (ov == null) null else if (f) (ov - 32) * 5 / 9 else ov
+                    val ac = if (av == null) null else if (f) (av - 32) * 5 / 9 else av
+                    if (listOfNotNull(oc, ac).any { it < 30.0 || it > 45.0 }) {
+                        toast("That temperature looks out of range")
+                    } else {
+                        val id = existing?.getString("id") ?: System.currentTimeMillis().toString()
+                        val entry = JSONObject().put("id", id).put("ts", ts)
+                        if (oc != null) entry.put("oral", oc)
+                        if (ac != null) entry.put("axi", ac)
+                        Core.saveTemps(this, Core.temps(this).filter { it.getString("id") != id } + entry)
+                        dlg.dismiss()
+                        show()
+                    }
+                }
+            }
+            if (existing != null) {
+                dlg.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener {
+                    val id = existing.getString("id")
+                    Core.saveTemps(this, Core.temps(this).filter { it.getString("id") != id })
+                    dlg.dismiss()
+                    show()
+                }
+            }
+        }
+        dlg.show()
+    }
+
+    private fun tempScreen() {
+        val f = tUnitF()
+        val hl = tHl()
+        val hdr = LinearLayout(this)
+        hdr.gravity = Gravity.CENTER_VERTICAL
+        val col = LinearLayout(this)
+        col.orientation = LinearLayout.VERTICAL
+        col.addView(tx("Temperature", 32f, p.ink, bold = true, serif = true))
+        col.addView(tx("Oral and axillary readings", 14f, p.mut, italic = true, serif = true))
+        hdr.addView(col, LinearLayout.LayoutParams(0, -2, 1f))
+        hdr.addView(pill("Close", false) {
+            showTemp = false
+            scroll.scrollTo(0, 0)
+            show()
+        })
+        box.addView(hdr)
+        box.addView(ornament(), lp(-1, -2, 0, 6, 0, 8))
+
+        addCard(p.gold) {
+            val r = LinearLayout(context)
+            r.gravity = Gravity.CENTER_VERTICAL
+            r.addView(tx("Unit", 15f, p.ink, serif = true), lp(0, -2, 0, 0, 10, 0).apply { weight = 1f })
+            r.addView(pill("°C", !f) {
+                Core.sp(this@MainActivity).edit().putString("tunit", "C").apply()
+                show()
+            }, lp(-2, -2, 0, 0, 8, 0))
+            r.addView(pill("°F", f) {
+                Core.sp(this@MainActivity).edit().putString("tunit", "F").apply()
+                show()
+            })
+            addView(r)
+            val sr = LinearLayout(context)
+            sr.gravity = Gravity.CENTER_VERTICAL
+            sr.addView(tx("Colour highlights", 15f, p.ink, serif = true), lp(0, -2).apply { weight = 1f })
+            val sw = Switch(context)
+            sw.isChecked = hl
+            sw.thumbTintList = ColorStateList.valueOf(p.gold)
+            sw.trackTintList = ColorStateList.valueOf(withA(p.gold, 0x66))
+            sw.setOnCheckedChangeListener { _, on ->
+                Core.sp(this@MainActivity).edit().putBoolean("thl", on).apply()
+                show()
+            }
+            sr.addView(sw)
+            addView(sr, lp(-1, -2, 0, 10, 0, 0))
+        }
+        box.addView(btn("+ Add reading", p.gold, p.onAcc) { tempDialog(null) }, lp(-2, -2, 0, 4, 0, 6))
+
+        val entries = Core.temps(this)
+        if (entries.isEmpty()) {
+            addCard(p.gold) {
+                addView(tx("No readings yet", 18f, p.ink, bold = true, serif = true))
+                addView(tx("Tap Add reading to record an oral or axillary temperature with the time.", 14f, p.mut))
+            }
+        } else {
+            if (hl) {
+                addCard(p.time) {
+                    addView(tx("Colour guide", 15f, p.ink, bold = true, serif = true))
+                    addView(hrow(*(0..4).map { chip(levelName(it), levelColor(it)) as View }.toTypedArray()), lp(-1, -2, 0, 6, 0, 0))
+                    fun rng(off: Double) = "Normal " + fmtNum(35.5 - off, f) + "–" + fmtT(37.5 - off, f) +
+                        " · Fever from " + fmtT(38.0 - off, f) + " · High from " + fmtT(39.5 - off, f)
+                    addView(tx("Oral: " + rng(0.0), 12f, p.mut), lp(-1, -2, 0, 8, 0, 0))
+                    addView(tx("Axillary: " + rng(0.5), 12f, p.mut), lp(-1, -2, 0, 2, 0, 0))
+                }
+            }
+            val recent = entries.takeLast(14)
+            addCard(p.time) {
+                val hh = LinearLayout(context)
+                hh.gravity = Gravity.CENTER_VERTICAL
+                hh.addView(tx("Trend", 15f, p.ink, bold = true, serif = true), lp(0, -2).apply { weight = 1f })
+                val cAx = c(if (p.dark) "#CC8FB0" else "#8C4A6B")
+                hh.addView(chip("Oral", p.time), lp(-2, -2, 0, 0, 6, 0))
+                hh.addView(chip("Axillary", cAx))
+                addView(hh)
+                val lf = SimpleDateFormat("d MMM h:mm a", Locale.getDefault())
+                val chart = TempChart(
+                    context,
+                    recent.map { if (it.has("oral")) it.getDouble("oral") else null },
+                    recent.map { if (it.has("axi")) it.getDouble("axi") else null },
+                    recent.map { lf.format(Date(it.getLong("ts"))) },
+                    f, p.time, cAx, p.mut, p.line, withA(p.ok, 0x22)
+                )
+                addView(chart, lp(-1, dp(200), 0, 8, 0, 0))
+                addView(tx("Shaded band: normal range for oral readings. Last " + recent.size + " entries.", 11f, p.mut, italic = true, serif = true))
+            }
+            val groups = entries.sortedByDescending { it.getLong("ts") }.groupBy { fmtDayLabel(it.getLong("ts")) }
+            for ((day, items) in groups) {
+                addCard(p.gold) {
+                    addView(tx(day, 15f, p.gold, bold = true, serif = true))
+                    addView(tRow(tx("TIME", 11f, p.mut, bold = true), hdrCell("ORAL"), hdrCell("AXILLARY")), lp(-1, -2, 0, 6, 0, 0))
+                    items.forEach { e ->
+                        addView(View(context).apply { setBackgroundColor(p.line) }, LinearLayout.LayoutParams(-1, dp(1)))
+                        val timeT = tx(SimpleDateFormat("h:mm a", Locale.getDefault()).format(Date(e.getLong("ts"))), 14f, p.time, bold = true, serif = true)
+                        timeT.setPadding(0, dp(9), 0, dp(9))
+                        val row = tRow(
+                            timeT,
+                            tCell("oral", if (e.has("oral")) e.getDouble("oral") else null, f, hl),
+                            tCell("axi", if (e.has("axi")) e.getDouble("axi") else null, f, hl)
+                        )
+                        row.setOnClickListener { tempDialog(e) }
+                        addView(row)
+                    }
+                }
+            }
+            box.addView(tx("Tap a row to edit or delete it.", 12f, p.mut, italic = true, serif = true), lp(-1, -2, 4, 4, 0, 0))
+        }
+        box.addView(
+            tx("General guide only. Fever thresholds vary with age and health. Contact a doctor for advice, especially for infants, older adults, or a temperature above 39.5°C (103.1°F).", 12f, p.mut, italic = true, serif = true),
+            lp(-1, -2, 4, 10, 4, 0)
+        )
+    }
+
     // ---------- Today ----------
     private fun openUrl(u: String) {
         try {
@@ -1160,6 +1548,7 @@ class MainActivity : Activity() {
         hcol.addView(tx("Today", 32f, p.ink, bold = true, serif = true))
         hcol.addView(tx(SimpleDateFormat("EEEE, d MMMM", Locale.getDefault()).format(now.time), 14f, p.mut, italic = true, serif = true))
         hdr.addView(hcol, LinearLayout.LayoutParams(0, -2, 1f))
+        hdr.addView(thermButton(), lp(dp(46), dp(46), 0, 0, 8, 0))
         hdr.addView(historyButton(), LinearLayout.LayoutParams(dp(46), dp(46)))
         box.addView(hdr)
         box.addView(ornament(), lp(-1, -2, 0, 6, 0, 8))
