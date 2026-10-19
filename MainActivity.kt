@@ -214,7 +214,8 @@ object Core {
     fun ymd(c: Calendar) = "%04d-%02d-%02d".format(c.get(Calendar.YEAR), c.get(Calendar.MONTH) + 1, c.get(Calendar.DAY_OF_MONTH))
     fun key(id: String, t: String) = ymd(Calendar.getInstance()) + "|" + id + "|" + t
     fun mode(m: JSONObject) = m.optString("mode", "times")
-    fun validHm(s: String) = Regex("^([01]?[0-9]|2[0-3]):[0-5][0-9]$").matches(s.trim())
+    private val validHmRegex = Regex("^([01]?[0-9]|2[0-3]):[0-5][0-9]$")
+    fun validHm(s: String) = validHmRegex.matches(s.trim())
     fun hm(s: String): Int {
         val p = s.trim().split(":")
         return p[0].toInt() * 60 + p[1].toInt()
@@ -674,35 +675,51 @@ class TempChart(
     private val cBand: Int
 ) : View(ctx) {
     private val d = ctx.resources.displayMetrics.density
+    // Reuse Paint instances: onDraw can be called frequently on high-refresh-rate displays.
+    private val bandPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = cBand }
+    private val gridPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = cLine
+        strokeWidth = d
+    }
+    private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = cText
+        textSize = 10f * d
+        textAlign = Paint.Align.RIGHT
+    }
+    private val oralLinePaint = linePaint(cOral)
+    private val axiLinePaint = linePaint(cAxi)
+    private val oralDotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = cOral }
+    private val axiDotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = cAxi }
+    private val chartValues = (oral.asSequence() + axi.asSequence()).filterNotNull().toList()
+    private val chartLow = (chartValues.minOrNull() ?: 36.0).coerceAtMost(35.0) - 0.4
+    private val chartHigh = (chartValues.maxOrNull() ?: 38.5).coerceAtLeast(38.5) + 0.4
+
+    private fun linePaint(color: Int) = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        this.color = color
+        strokeWidth = 2f * d
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+    }
     private fun u(c: Double) = if (fahrenheit) c * 9 / 5 + 32 else c
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
         val n = oral.size
-        val vals = (oral + axi).filterNotNull()
-        if (n == 0 || vals.isEmpty()) return
+        if (n == 0 || chartValues.isEmpty() || width <= 0 || height <= 0) return
         val w = width.toFloat()
         val h = height.toFloat()
         val l = 42f * d
         val r = 12f * d
         val t = 12f * d
         val b = 28f * d
-        val lo = minOf(vals.minOrNull() ?: 36.0, 35.0) - 0.4
-        val hi = maxOf(vals.maxOrNull() ?: 38.0, 38.5) + 0.4
+        val lo = chartLow
+        val hi = chartHigh
         fun yOf(c: Double): Float = t + (h - t - b) * (1.0 - (c - lo) / (hi - lo)).toFloat()
         fun xOf(i: Int): Float = if (n == 1) (l + w - r) / 2f else l + (w - l - r) * i / (n - 1)
 
-        val band = Paint(Paint.ANTI_ALIAS_FLAG)
-        band.color = cBand
-        canvas.drawRect(l, yOf(37.5), w - r, yOf(35.5), band)
-
-        val gp = Paint(Paint.ANTI_ALIAS_FLAG)
-        gp.color = cLine
-        gp.strokeWidth = d
-        val tp = Paint(Paint.ANTI_ALIAS_FLAG)
-        tp.color = cText
-        tp.textSize = 10f * d
-        tp.textAlign = Paint.Align.RIGHT
+        canvas.drawRect(l, yOf(37.5), w - r, yOf(35.5), bandPaint)
+        val gp = gridPaint
+        val tp = textPaint
         val step = if (fahrenheit) 2.0 else 1.0
         var v = Math.ceil(u(lo) / step) * step
         val vmax = Math.floor(u(hi))
@@ -714,14 +731,7 @@ class TempChart(
             v += step
         }
 
-        fun series(vs: List<Double?>, col: Int) {
-            val lineP = Paint(Paint.ANTI_ALIAS_FLAG)
-            lineP.color = col
-            lineP.strokeWidth = 2f * d
-            lineP.style = Paint.Style.STROKE
-            lineP.strokeCap = Paint.Cap.ROUND
-            val dotP = Paint(Paint.ANTI_ALIAS_FLAG)
-            dotP.color = col
+        fun series(vs: List<Double?>, lineP: Paint, dotP: Paint) {
             var px = -1f
             var py = -1f
             for (i in vs.indices) {
@@ -737,12 +747,12 @@ class TempChart(
                 canvas.drawCircle(xOf(i), yOf(c), 4f * d, dotP)
             }
         }
-        series(oral, cOral)
-        series(axi, cAxi)
+        series(oral, oralLinePaint, oralDotPaint)
+        series(axi, axiLinePaint, axiDotPaint)
 
         tp.textSize = 9f * d
         tp.textAlign = Paint.Align.LEFT
-        canvas.drawText(labels.first(), l, h - 8f * d, tp)
+        if (labels.isNotEmpty()) canvas.drawText(labels.first(), l, h - 8f * d, tp)
         if (labels.size > 1) {
             tp.textAlign = Paint.Align.RIGHT
             canvas.drawText(labels.last(), w - r, h - 8f * d, tp)
@@ -2456,13 +2466,15 @@ class MainActivity : Activity() {
         }
     }
 
+    private val testDataIntentRegex = Regex("\\b(test|testing|random|fake|mock|dummy|sample)\\b", RegexOption.IGNORE_CASE)
+
     private fun runAI(q: String) {
         aiText = q
         val key = Core.getKey(this)
         val model = Core.sp(this).getString("model", "gemini-3.5-flash-lite") ?: "gemini-3.5-flash-lite"
         if (q.isBlank()) return
         val developerMode = Core.sp(this).getBoolean("developer_mode", false)
-        val asksForTestData = Regex("\\b(test|testing|random|fake|mock|dummy|sample)\\b", RegexOption.IGNORE_CASE).containsMatchIn(q)
+        val asksForTestData = testDataIntentRegex.containsMatchIn(q)
         if (developerMode && asksForTestData) {
             ai = createDeveloperTestMeds(q)
             aiRemoveMode = false

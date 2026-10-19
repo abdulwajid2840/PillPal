@@ -219,3 +219,10 @@ The following are open questions, not assumptions:
 **Next action:** The user chooses the first task and provides any
 critical Claude handoff context. Then define acceptance criteria before
 editing code.
+
+## Performance pass (2026-10-19)
+- Reused `Paint` instances and cached immutable chart bounds in `TempChart.onDraw` to reduce per-frame allocations and repeated scans.
+- Reused compiled regular expressions for time validation and developer test-intent detection.
+- No new dependencies were introduced.
+- Remaining performance work: measure screen rebuild costs (`show()` rebuilds the current tab), list-rendering cost, and scroll frame pacing with Android Studio profiling on-device before considering a larger UI refactor.
+- Verification status: source-level change only; CI build and high-refresh-rate device testing remain required.
