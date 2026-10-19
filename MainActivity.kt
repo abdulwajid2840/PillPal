@@ -901,7 +901,7 @@ class MainActivity : Activity() {
         background = bg(withA(col, 0x2A), 12f); setPadding(dp(10), dp(4), dp(10), dp(4))
     }
     private fun btn(label: String, fill: Int, textCol: Int, outline: Boolean = false, f: () -> Unit) = Button(this).apply {
-        text = label; setAllCaps(false); textSize = 15f; setTextColor(textCol)
+        text = label; setAllCaps(false); textSize = 15f; setTextColor(textCol); isSingleLine = true; ellipsize = android.text.TextUtils.TruncateAt.END; gravity = Gravity.CENTER
         typeface = Typeface.create("serif", Typeface.BOLD)
         minHeight = 0; minimumHeight = dp(44); minWidth = 0; minimumWidth = dp(64)
         stateListAnimator = null; elevation = 0f
@@ -2329,6 +2329,12 @@ class MainActivity : Activity() {
             }
             box.addView(manage)
         }
+        if (Core.sp(this).getBoolean("developer_mode", false)) {
+            addCard(p.time) {
+                addView(tx("Developer mode is ON", 14f, p.gold, bold = true))
+                addView(tx("Requests for random, mock, dummy, sample or test data create synthetic TEST ONLY entries locally. Disable Developer mode for normal medication parsing.", 12f, p.mut))
+            }
+        }
         addCard(p.bad) {
             addView(tx("Double-check before adding", 16f, p.bad, bold = true, serif = true))
             addView(tx("AI can make mistakes. Always verify names, doses and timings against your prescription, or with your doctor or pharmacist, before adding anything.", 13f, p.ink))
@@ -2423,16 +2429,54 @@ class MainActivity : Activity() {
         show()
     }
 
+    private fun createDeveloperTestMeds(request: String): List<JSONObject> {
+        val count = Regex("\\b(\\d{1,2})\\b").find(request)?.groupValues?.get(1)?.toIntOrNull()?.coerceIn(1, 30) ?: 10
+        val today = Core.ymd(Calendar.getInstance())
+        val times = listOf(listOf("08:00"), listOf("08:00", "20:00"), listOf("08:00", "14:00", "20:00"))
+        return (1..count).map { i ->
+            val modeIndex = (i - 1) % 3
+            JSONObject()
+                .put("id", "devtest_${System.currentTimeMillis()}_$i")
+                .put("name", "TEST ONLY — Sample Medicine %02d".format(i))
+                .put("dose", "TEST ONLY — sample dose")
+                .put("per", (i % 3) + 1)
+                .put("mode", "times")
+                .put("times", JSONArray(times[modeIndex]))
+                .put("intervalMin", 0)
+                .put("winStart", "00:00")
+                .put("winEnd", "23:59")
+                .put("days", JSONArray(listOf(1, 2, 3, 4, 5, 6, 7)))
+                .put("every", 1)
+                .put("cycleOn", 0)
+                .put("cycleOff", 0)
+                .put("start", today)
+                .put("end", "")
+                .put("stock", 20 + i)
+                .put("notes", "DEVELOPER TEST DATA ONLY — not a real medicine. Do not use for treatment.")
+        }
+    }
+
     private fun runAI(q: String) {
         aiText = q
         val key = Core.getKey(this)
         val model = Core.sp(this).getString("model", "gemini-3.5-flash-lite") ?: "gemini-3.5-flash-lite"
+        if (q.isBlank()) return
+        val developerMode = Core.sp(this).getBoolean("developer_mode", false)
+        val asksForTestData = Regex("\\b(test|testing|random|fake|mock|dummy|sample)\\b", RegexOption.IGNORE_CASE).containsMatchIn(q)
+        if (developerMode && asksForTestData) {
+            ai = createDeveloperTestMeds(q)
+            aiRemoveMode = false
+            selectedAiRemoveIds.clear()
+            aiSel = ai.map { it.getString("id") }.toMutableSet()
+            aiMsg = "Created ${ai.size} synthetic TEST ONLY entries locally. They are not real medicines and must not be used for treatment."
+            show()
+            return
+        }
         if (key.isEmpty()) {
             aiMsg = "Add your Gemini API key in Settings first."
             show()
             return
         }
-        if (q.isBlank()) return
         aiMsg = "Reading your text..."
         show()
         thread {
@@ -2492,6 +2536,17 @@ class MainActivity : Activity() {
                 rows.addView(row)
             }
             addView(rows)
+        }
+        val devMode = sp.getBoolean("developer_mode", false)
+        addCard(p.time) {
+            addView(tx("Developer mode", 18f, p.ink, bold = true, serif = true))
+            addView(tx("Enables synthetic test data for UI and reminder testing. Test entries are clearly marked and must never be used as real medication records.", 13f, p.mut))
+            addView(btn(if (devMode) "Developer mode: ON" else "Developer mode: OFF", if (devMode) p.ok else p.mut, if (devMode) Color.WHITE else p.ink, !devMode) {
+                val next = !Core.sp(this@MainActivity).getBoolean("developer_mode", false)
+                Core.sp(this@MainActivity).edit().putBoolean("developer_mode", next).apply()
+                toast(if (next) "Developer mode enabled — test data only" else "Developer mode disabled")
+                show()
+            }, lp(-2, -2, 0,  8, 0, 0))
         }
         val key = field("AIza...", Core.getKey(this))
         key.transformationMethod = PasswordTransformationMethod.getInstance()
