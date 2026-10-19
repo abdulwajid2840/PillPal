@@ -21,6 +21,8 @@ import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.RippleDrawable
 import android.view.Gravity
+import android.view.MotionEvent
+import android.view.GestureDetector
 import android.view.View
 import android.view.animation.OvershootInterpolator
 import android.graphics.drawable.Drawable
@@ -109,6 +111,14 @@ object Crypto {
         return String(c.doFinal(all.copyOfRange(12, all.size)), Charsets.UTF_8)
     }
 
+    fun clearStoredKey() {
+        runCatching {
+            val ks = KeyStore.getInstance("AndroidKeyStore")
+            ks.load(null)
+            if (ks.containsAlias(ALIAS)) ks.deleteEntry(ALIAS)
+        }
+    }
+
     private fun derive(pass: String, salt: ByteArray, iter: Int): SecretKey {
         val f = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")
         return SecretKeySpec(f.generateSecret(PBEKeySpec(pass.toCharArray(), salt, iter, 256)).encoded, "AES")
@@ -172,6 +182,13 @@ object Core {
         saveMeds(c, l.filter { it.getString("id") != id })
     }
 
+    fun clearAllData(c: Context) {
+        meds(c).forEach { cancelAll(c, it) }
+        (c.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).cancelAll()
+        sp(c).edit().clear().commit()
+        Crypto.clearStoredKey()
+    }
+
     // ---- API key (encrypted with the Android Keystore) ----
     fun getKey(c: Context): String {
         val enc = sp(c).getString("key_enc", "") ?: ""
@@ -205,13 +222,14 @@ object Core {
     fun parseInterval(s: String): Int {
         val r = Regex("^([0-9]+)\\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)?$")
         val mt = r.find(s.trim().lowercase()) ?: return 0
-        val n = mt.groupValues[1].toIntOrNull() ?: return 0
+        val n = mt.groupValues[1].toLongOrNull() ?: return 0
         val mult = when (mt.groupValues[2]) {
-            "h", "hr", "hrs", "hour", "hours" -> 60
-            "d", "day", "days" -> 1440
-            else -> 1
+            "h", "hr", "hrs", "hour", "hours" -> 60L
+            "d", "day", "days" -> 1440L
+            else -> 1L
         }
-        return n * mult
+        val total = n * mult
+        return if (total in 1L..525600L) total.toInt() else 0
     }
     fun fmtInterval(min: Int): String {
         if (min >= 1440 && min % 1440 == 0) return (min / 1440).toString() + " day" + (if (min / 1440 > 1) "s" else "")
@@ -242,12 +260,34 @@ object Core {
         return num * mult * unit
     }
     fun warn(m: JSONObject): String? {
-        val mg = doseMg(m.optString("dose", ""))
+        val name = m.optString("name", "")
+        val dose = m.optString("dose", "")
+        val notes = m.optString("notes", "")
+        val all = "$name $dose $notes"
+        val mg = doseMg(dose)
         if (mg != null && mg > 5000) {
-            return "This dose looks unusually high. Please check it with a doctor or pharmacist before using it."
+            return "Safety check: this stated dose is unusually large by a simple mass threshold. Do not rely on this app to determine a safe dose; verify the exact prescription with a doctor or pharmacist."
+        }
+        val vol = Regex("([0-9][0-9,]*\\.?[0-9]*)\\s*(litres?|liters?|litters?|l|ml|millilitres?|milliliters?)\\b", RegexOption.IGNORE_CASE).find(all)
+        if (vol != null) {
+            val amount = vol.groupValues[1].replace(",", "").toDoubleOrNull()
+            val unit = vol.groupValues[2].lowercase()
+            val ml = amount?.let { if (unit == "l" || unit.startsWith("litre") || unit.startsWith("liter") || unit.startsWith("litter")) it * 1000.0 else it }
+            if (ml != null && ml > 100.0) {
+                return "Safety check: this liquid volume looks unusually large for a single dose. Confirm the unit and amount with a qualified clinician before using it."
+            }
+        }
+        if (Regex("\\b(uranium|radioactive|radioactivity|radiation|poison|toxic substance)\\b", RegexOption.IGNORE_CASE).containsMatchIn(all)) {
+            return "Safety alert: this entry mentions a potentially hazardous substance or radiation. Do not ingest, handle, or use it as medication; seek qualified emergency or poison-control guidance if exposure may have occurred."
+        }
+        if (Regex("\\bsteroids?\\b", RegexOption.IGNORE_CASE).containsMatchIn(all) && dose.isBlank()) {
+            return "Safety check: specify the exact prescribed steroid and strength. 'Steroids' alone is not enough to identify a medicine or verify a dose; confirm the label with a doctor or pharmacist."
         }
         if (mode(m) == "interval" && m.optInt("intervalMin", 0) in 1..59) {
-            return "Reminders more often than every hour. Make sure this schedule is really what your doctor prescribed."
+            return "Safety check: reminders are set more frequently than hourly. Confirm this schedule exactly matches the prescription with a doctor or pharmacist."
+        }
+        if (m.optInt("per", 1) !in 1..100 || m.optInt("stock", -1) < -1) {
+            return "Safety check: one or more quantity values are outside the app's supported range. Edit and verify the entry before using it."
         }
         return null
     }
@@ -735,6 +775,11 @@ class MainActivity : Activity() {
     private var aiSel: MutableSet<String> = mutableSetOf()
     private var aiEditIdx = -1
     private var pendingPass: String? = null
+    private var lastCard: View? = null
+    private var medSelectMode = false
+    private var selectedMedIds: MutableSet<String> = mutableSetOf()
+    private var aiRemoveMode = false
+    private var selectedAiRemoveIds: MutableSet<String> = mutableSetOf()
 
     // ---------- theme ----------
     private fun c(s: String) = Color.parseColor(s)
@@ -755,11 +800,33 @@ class MainActivity : Activity() {
     private fun lightPal(): Pal {
         return Pal(false, c("#F2E8D0"), c("#FBF6E9"), c("#3A2E26"), c("#7C6C57"), c("#9A6B2F"), c("#5B7A4A"), c("#A8473C"), c("#3E5C86"), c("#DCCBA6"), c("#F6E7BF"), c("#FFF8E8"))
     }
+    private val accentChoices = listOf(
+        Triple("amber", "Amber", "#9A6B2F"),
+        Triple("ocean", "Ocean", "#326C9B"),
+        Triple("forest", "Forest", "#3F7657"),
+        Triple("rose", "Rose", "#B34F69"),
+        Triple("violet", "Violet", "#7655A6"),
+        Triple("teal", "Teal", "#16827B")
+    )
     private fun pal(dark: Boolean): Pal {
-        if (dark) {
-            return darkPal()
+        val base = if (dark) darkPal() else lightPal()
+        val selected = Core.sp(this).getString("accent", "amber") ?: "amber"
+        val hex = accentChoices.firstOrNull { it.first == selected }?.third ?: "#9A6B2F"
+        val accent = c(hex).let { if (dark) blend(it, Color.WHITE, 0.18f) else it }
+        val hi = withA(accent, if (dark) 42 else 28)
+        val onAccent = if (ColorUtilsLike.luminance(accent) > 0.52) Color.BLACK else Color.WHITE
+        return Pal(base.dark, base.bg, base.card, base.ink, base.mut, accent, base.ok, base.bad, base.time, base.line, hi, onAccent)
+    }
+    private fun blend(a: Int, b: Int, ratio: Float): Int = Color.rgb(
+        (Color.red(a) * (1 - ratio) + Color.red(b) * ratio).toInt(),
+        (Color.green(a) * (1 - ratio) + Color.green(b) * ratio).toInt(),
+        (Color.blue(a) * (1 - ratio) + Color.blue(b) * ratio).toInt()
+    )
+    private object ColorUtilsLike {
+        fun luminance(color: Int): Double {
+            fun channel(v: Int): Double { val x = v / 255.0; return if (x <= 0.03928) x / 12.92 else Math.pow((x + 0.055) / 1.055, 2.4) }
+            return 0.2126 * channel(Color.red(color)) + 0.7152 * channel(Color.green(color)) + 0.0722 * channel(Color.blue(color))
         }
-        return lightPal()
     }
     private val medLight = listOf("#B5483A", "#3D5A80", "#4F7A5A", "#C98B2B", "#8C4A6B", "#7A5C3E")
     private val medDark = listOf("#E07A68", "#86A8D4", "#80B68E", "#E6B456", "#CC8FB0", "#BE9A78")
@@ -863,6 +930,7 @@ class MainActivity : Activity() {
         inner.build()
         outer.addView(inner, LinearLayout.LayoutParams(0, -2, 1f))
         (host ?: box).addView(outer, lp(-1, -2, 2, 7, 2, 7))
+        lastCard = outer
     }
     private fun ornament(): LinearLayout {
         val r = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
@@ -911,6 +979,30 @@ class MainActivity : Activity() {
         lightBars(!p.dark)
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setBackgroundColor(p.bg); fitsSystemWindows = true }
         scroll = ScrollView(this)
+        scroll.isClickable = true
+        val swipeDetector = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+            override fun onDown(e: MotionEvent) = true
+            override fun onFling(e1: MotionEvent?, e2: MotionEvent, velocityX: Float, velocityY: Float): Boolean {
+                val a = e1 ?: return false
+                val dx = e2.x - a.x
+                val dy = e2.y - a.y
+                if (kotlin.math.abs(dx) > dp(72) && kotlin.math.abs(dx) > kotlin.math.abs(dy) * 1.35f && kotlin.math.abs(velocityX) > dp(180) && editing == null && !showLog && !showTemp) {
+                    val next = (tab + if (dx < 0) 1 else -1).coerceIn(0, 3)
+                    if (next != tab) {
+                        tab = next
+                        medSelectMode = false
+                        selectedMedIds.clear()
+                        aiRemoveMode = false
+                        selectedAiRemoveIds.clear()
+                        scroll.scrollTo(0, 0)
+                        show()
+                    }
+                    return true
+                }
+                return false
+            }
+        })
+        scroll.setOnTouchListener { _, event -> swipeDetector.onTouchEvent(event); false }
         box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(16), dp(10), dp(16), dp(24)) }
         scroll.addView(box)
         nav = LinearLayout(this)
@@ -1020,6 +1112,12 @@ class MainActivity : Activity() {
             }
             item.setOnClickListener {
                 if (tab != i || showLog || showTemp || aiEditIdx >= 0) {
+                    if (tab != i) {
+                        medSelectMode = false
+                        selectedMedIds.clear()
+                        aiRemoveMode = false
+                        selectedAiRemoveIds.clear()
+                    }
                     tab = i
                     showLog = false
                     showTemp = false
@@ -1097,27 +1195,17 @@ class MainActivity : Activity() {
     }
 
     private fun penButton(f: () -> Unit): View {
-        val colr = p.gold
-        val v = object : View(this) {
-            override fun onDraw(canvas: Canvas) {
-                super.onDraw(canvas)
-                val w = width.toFloat()
-                val h = height.toFloat()
-                val a = minOf(w, h) * 0.24f
-                val paint = Paint(Paint.ANTI_ALIAS_FLAG)
-                paint.style = Paint.Style.STROKE
-                paint.strokeCap = Paint.Cap.ROUND
-                paint.color = colr
-                paint.strokeWidth = dp(3).toFloat()
-                canvas.drawLine(w / 2 - a, h / 2 + a * 0.6f, w / 2 + a, h / 2 - a * 0.9f, paint)
-                paint.strokeWidth = dp(2).toFloat()
-                canvas.drawLine(w / 2 - a * 1.3f, h / 2 + a * 1.4f, w / 2 + a * 0.2f, h / 2 + a * 1.4f, paint)
-            }
+        return TextView(this).apply {
+            text = "✎  Edit"
+            textSize = 13f
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+            setTextColor(p.gold)
+            background = bg(p.hi, 18f, p.gold, 1)
+            contentDescription = "Edit suggestion"
+            setPadding(dp(8), 0, dp(8), 0)
+            setOnClickListener { f() }
         }
-        v.background = bg(p.hi, 20f, p.gold, 1)
-        v.contentDescription = "Edit"
-        v.setOnClickListener { f() }
-        return v
     }
 
     private fun logLine(e: JSONObject, col: Int): View {
@@ -1698,16 +1786,49 @@ class MainActivity : Activity() {
 
     private fun medsList() {
         heading("Medicines", "Your medicine shelf")
-        box.addView(btn("+ Add medicine", p.gold, p.onAcc) {
+        val actions = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+        actions.addView(btn("+ Add medicine", p.gold, p.onAcc) {
+            medSelectMode = false
             editing = newMed()
             scroll.scrollTo(0, 0)
             show()
+        }, lp(0, -2, 0, 4, 8, 8).apply { weight = 1f })
+        actions.addView(btn(if (medSelectMode) "Cancel" else "Manage ▾", p.mut, p.mut, true) {
+            medSelectMode = !medSelectMode
+            if (!medSelectMode) selectedMedIds.clear()
+            show()
         }, lp(-2, -2, 0, 4, 0, 8))
+        box.addView(actions)
         val l = Core.meds(this)
+        if (medSelectMode) {
+            val tools = LinearLayout(this)
+            tools.addView(btn(if (selectedMedIds.size == l.size) "Deselect all" else "Select all", p.gold, p.gold, true) {
+                if (selectedMedIds.size == l.size) selectedMedIds.clear() else selectedMedIds = l.map { it.getString("id") }.toMutableSet()
+                show()
+            }, lp(-2, -2, 0, 0, 8, 8))
+            tools.addView(btn("Remove (${selectedMedIds.size})", p.bad, Color.WHITE) {
+                val ids = selectedMedIds.toSet()
+                if (ids.isEmpty()) { toast("Select at least one medicine"); return@btn }
+                AlertDialog.Builder(this).setTitle("Remove selected medicines?")
+                    .setMessage("This removes ${ids.size} medicine(s) and cancels their reminders. Dose history will remain.")
+                    .setNegativeButton("Cancel", null).setPositiveButton("Remove") { _, _ ->
+                        ids.forEach { Core.delete(this@MainActivity, it) }
+                        selectedMedIds.clear(); medSelectMode = false; show()
+                    }.show()
+            }, lp(-2, -2, 0, 0, 0, 8))
+            box.addView(tools)
+        }
         if (l.isEmpty()) addCard(p.gold) { addView(tx("The shelf is empty. Add a medicine by hand or with Ask AI.", 14f, p.mut)) }
         l.forEach { m ->
             val col = colorFor(m)
-            addCard(col) {
+            addCard(col, medSelectMode && selectedMedIds.contains(m.getString("id"))) {
+                if (medSelectMode) {
+                    addView(pill(if (selectedMedIds.contains(m.getString("id"))) "✓ Selected" else "Tap to select", selectedMedIds.contains(m.getString("id"))) {
+                        val mid = m.getString("id")
+                        if (!selectedMedIds.add(mid)) selectedMedIds.remove(mid)
+                        show()
+                    }, lp(-2, -2, 0, 0, 0, 8))
+                }
                 addView(tx(m.getString("name"), 20f, p.ink, bold = true, serif = true))
                 if (m.optString("dose") != "") addView(tx(m.optString("dose"), 15f, col, bold = true))
                 addView(tx(describe(m), 14f, p.time))
@@ -1717,7 +1838,20 @@ class MainActivity : Activity() {
                 if (w != null) addView(tx(w, 13f, p.bad, italic = true, serif = true))
                 val sk = m.optInt("stock", -1)
                 if (sk >= 0) addView(chip("Stock $sk", if (sk <= 5) p.bad else p.ok), lp(-2, -2, 0, 6, 0, 0))
-                addView(btn("Edit", p.gold, p.gold, true) { editing = m; scroll.scrollTo(0, 0); show() }, lp(-2, -2, 0, 10, 0, 0))
+                if (!medSelectMode) addView(btn("Edit", p.gold, p.gold, true) { editing = m; scroll.scrollTo(0, 0); show() }, lp(-2, -2, 0, 10, 0, 0))
+            }
+            lastCard?.setOnLongClickListener {
+                medSelectMode = true
+                selectedMedIds.add(m.getString("id"))
+                show()
+                true
+            }
+            lastCard?.setOnClickListener {
+                if (medSelectMode) {
+                    val mid = m.getString("id")
+                    if (!selectedMedIds.add(mid)) selectedMedIds.remove(mid)
+                    show()
+                }
             }
         }
     }
@@ -1918,9 +2052,15 @@ class MainActivity : Activity() {
         fun validate(): String? {
             val md = Core.mode(m)
             if (m.getString("name").isBlank()) return "Enter a name"
+            if (per.text.toString().toIntOrNull()?.let { it in 1..100 } != true) return "Units per dose must be between 1 and 100"
+            val stockText = stock.text.toString().trim()
+            if (stockText.isNotEmpty() && stockText.toIntOrNull()?.let { it in 0..1000000 } != true) return "Stock must be a whole number between 0 and 1,000,000, or leave it blank"
+            if (every.text.toString().toIntOrNull()?.let { it in 1..3650 } != true) return "Repeat days must be between 1 and 3,650"
+            if (con.text.toString().isNotBlank() && con.text.toString().toIntOrNull()?.let { it in 1..3650 } != true) return "Cycle-on days must be between 1 and 3,650"
+            if (coff.text.toString().isNotBlank() && coff.text.toString().toIntOrNull()?.let { it in 1..3650 } != true) return "Cycle-off days must be between 1 and 3,650"
             if (md != "asneeded" && m.getJSONArray("days").length() == 0) return "Pick at least one day"
             if (md == "times" && m.getJSONArray("times").length() == 0) return "Add at least one time"
-            if (md == "interval" && m.optInt("intervalMin", 0) < 1) return "Enter how often, like 5m or 8h"
+            if (md == "interval" && m.optInt("intervalMin", 0) !in 1..525600) return "Enter a repeat interval between 1 minute and 365 days"
             if (md == "interval" && Core.hm(m.optString("winStart", "00:00")) > Core.hm(m.optString("winEnd", "23:59"))) {
                 return "Until must be later than From"
             }
@@ -2101,6 +2241,12 @@ class MainActivity : Activity() {
             addView(foodPills, lp(-1, -2, 0, 8, 0, 0))
         }
 
+        Core.warn(m)?.let { warning ->
+            addCard(p.bad) {
+                addView(tx("Safety warning", 16f, p.bad, bold = true, serif = true))
+                addView(tx(warning, 14f, p.bad, bold = true))
+            }
+        }
         val saveB = btn("Save", p.gold, p.onAcc) {
             collect()
             if (m.optString("start") == "") m.put("start", Core.ymd(Calendar.getInstance()))
@@ -2161,6 +2307,28 @@ class MainActivity : Activity() {
     // ---------- Ask AI ----------
     private fun aiTab() {
         heading("Ask AI", "Describe it, and the scribe fills the schedule")
+        if (ai.isNotEmpty()) {
+            val manage = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+            manage.addView(btn(if (aiRemoveMode) "Cancel selection" else "Manage suggestions ▾", p.mut, p.mut, true) {
+                aiRemoveMode = !aiRemoveMode
+                if (!aiRemoveMode) selectedAiRemoveIds.clear()
+                show()
+            }, lp(-2, -2, 0, 2, 8, 8))
+            if (aiRemoveMode) {
+                manage.addView(btn(if (selectedAiRemoveIds.size == ai.size) "Deselect all" else "Select all", p.gold, p.gold, true) {
+                    if (selectedAiRemoveIds.size == ai.size) selectedAiRemoveIds.clear() else selectedAiRemoveIds = ai.map { it.getString("id") }.toMutableSet()
+                    show()
+                }, lp(-2, -2, 0, 2, 8, 8))
+                manage.addView(btn("Remove (${selectedAiRemoveIds.size})", p.bad, Color.WHITE) {
+                    if (selectedAiRemoveIds.isEmpty()) { toast("Select at least one suggestion"); return@btn }
+                    ai = ai.filter { it.getString("id") !in selectedAiRemoveIds }
+                    selectedAiRemoveIds.clear(); aiRemoveMode = false
+                    aiSel.retainAll(ai.map { it.getString("id") }.toSet())
+                    show()
+                }, lp(-2, -2, 0, 2, 0, 8))
+            }
+            box.addView(manage)
+        }
         addCard(p.bad) {
             addView(tx("Double-check before adding", 16f, p.bad, bold = true, serif = true))
             addView(tx("AI can make mistakes. Always verify names, doses and timings against your prescription, or with your doctor or pharmacist, before adding anything.", 13f, p.ink))
@@ -2176,16 +2344,20 @@ class MainActivity : Activity() {
             val id = m.getString("id")
             val col = colorFor(m)
             val on = aiSel.contains(id)
-            addCard(col, on) {
+            addCard(col, on || (aiRemoveMode && selectedAiRemoveIds.contains(id))) {
+                if (aiRemoveMode) addView(pill(if (selectedAiRemoveIds.contains(id)) "✓ Selected for removal" else "Tap to select for removal", selectedAiRemoveIds.contains(id)) {
+                    if (!selectedAiRemoveIds.add(id)) selectedAiRemoveIds.remove(id)
+                    show()
+                }, lp(-2, -2, 0, 0, 0, 8))
                 val top = LinearLayout(context)
                 top.gravity = Gravity.CENTER_VERTICAL
                 top.addView(tx(m.getString("name"), 18f, p.ink, bold = true, serif = true), LinearLayout.LayoutParams(0, -2, 1f))
-                top.addView(penButton {
+                if (!aiRemoveMode) top.addView(penButton {
                     editing = JSONObject(m.toString())
                     aiEditIdx = i
                     scroll.scrollTo(0, 0)
                     show()
-                }, LinearLayout.LayoutParams(dp(38), dp(38)))
+                }, LinearLayout.LayoutParams(dp(76), dp(38)))
                 addView(top)
                 if (m.optString("dose") != "") addView(tx(m.optString("dose"), 15f, col, bold = true))
                 addView(tx(describe(m), 14f, p.time))
@@ -2194,16 +2366,30 @@ class MainActivity : Activity() {
                 if (m.optString("notes") != "") addView(tx(m.optString("notes"), 14f, p.mut, italic = true, serif = true))
                 val w = Core.warn(m)
                 if (w != null) addView(tx(w, 13f, p.bad, italic = true, serif = true))
-                val r = LinearLayout(context)
-                r.addView(pill(if (on) "✓ Included" else "Not included", on) {
-                    if (on) aiSel.remove(id) else aiSel.add(id)
+                if (!aiRemoveMode) {
+                    val r = LinearLayout(context)
+                    r.addView(pill(if (on) "✓ Included" else "Not included", on) {
+                        if (on) aiSel.remove(id) else aiSel.add(id)
+                        show()
+                    }, lp(-2, -2, 0, 10, 8, 0))
+                    r.addView(pill("Add this one", false) { addAi(listOf(m)) }, lp(-2, -2, 0, 10, 0, 0))
+                    addView(r)
+                }
+            }
+            lastCard?.setOnLongClickListener {
+                aiRemoveMode = true
+                selectedAiRemoveIds.add(id)
+                show()
+                true
+            }
+            lastCard?.setOnClickListener {
+                if (aiRemoveMode) {
+                    if (!selectedAiRemoveIds.add(id)) selectedAiRemoveIds.remove(id)
                     show()
-                }, lp(-2, -2, 0, 10, 8, 0))
-                r.addView(pill("Add this one", false) { addAi(listOf(m)) }, lp(-2, -2, 0, 10, 0, 0))
-                addView(r)
+                }
             }
         }
-        if (ai.isNotEmpty()) {
+        if (ai.isNotEmpty() && !aiRemoveMode) {
             val n = ai.count { aiSel.contains(it.getString("id")) }
             val r = LinearLayout(this)
             r.addView(btn("Add selected ($n)", p.ok, p.onAcc) {
@@ -2228,7 +2414,7 @@ class MainActivity : Activity() {
         val ids = items.map { it.getString("id") }
         items.forEach { Core.upsert(this, it) }
         ai = ai.filter { it.getString("id") !in ids }
-        ids.forEach { aiSel.remove(it) }
+        ids.forEach { aiSel.remove(it); selectedAiRemoveIds.remove(it) }
         aiMsg = "Added " + items.size + (if (items.size == 1) " medicine." else " medicines.")
         if (ai.isEmpty()) {
             aiText = ""
@@ -2254,6 +2440,8 @@ class MainActivity : Activity() {
                 val r = Core.ask(key, model, q)
                 runOnUiThread {
                     ai = r
+                    aiRemoveMode = false
+                    selectedAiRemoveIds.clear()
                     aiSel = r.map { it.getString("id") }.toMutableSet()
                     aiMsg = if (r.isEmpty()) "No medicines found." else "Review each entry, edit with the pencil if needed, then add."
                     show()
@@ -2285,6 +2473,25 @@ class MainActivity : Activity() {
                 )
             }
             addView(r)
+        }
+        addCard(p.time) {
+            addView(tx("Accent colour", 18f, p.ink, bold = true, serif = true))
+            addView(tx("Choose a colour for highlights and navigation. Warning colours stay distinct.", 13f, p.mut))
+            val selected = sp.getString("accent", "amber") ?: "amber"
+            val rows = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
+            accentChoices.chunked(3).forEach { group ->
+                val row = LinearLayout(context)
+                group.forEach { (id, label, hex) ->
+                    val col = c(hex)
+                    val b = btn((if (selected == id) "✓ " else "") + label, col, if (ColorUtilsLike.luminance(col) > 0.52) Color.BLACK else Color.WHITE, selected == id) {
+                        sp.edit().putString("accent", id).apply()
+                        recreate()
+                    }
+                    row.addView(b, lp(0, -2, 0, 6, 6, 0).apply { weight = 1f })
+                }
+                rows.addView(row)
+            }
+            addView(rows)
         }
         val key = field("AIza...", Core.getKey(this))
         key.transformationMethod = PasswordTransformationMethod.getInstance()
@@ -2340,6 +2547,25 @@ class MainActivity : Activity() {
             r.addView(btn("Export", p.gold, p.onAcc) { exportBackup() }, lp(-2, -2, 0, 10, 8, 0))
             r.addView(btn("Import", p.gold, p.gold, true) { importBackup() }, lp(-2, -2, 0, 10, 0, 0))
             addView(r)
+        }
+        addCard(p.bad) {
+            addView(tx("Delete all app data", 18f, p.bad, bold = true, serif = true))
+            addView(tx("Permanently removes medicines, dose and adherence logs, temperature records, pending reminders, Gemini key, and saved preferences. Export a backup first if you may need these later.", 13f, p.mut))
+            addView(btn("Delete everything…", p.bad, Color.WHITE) {
+                AlertDialog.Builder(this@MainActivity)
+                    .setTitle("Delete all PillPal data?")
+                    .setMessage("This permanently removes all medicines, temperature logs, dose history, backup-related data stored in preferences, the saved Gemini API key and appearance settings. Pending notifications and reminders will be cancelled. This cannot be undone.")
+                    .setNegativeButton("Cancel", null)
+                    .setPositiveButton("Delete everything") { _, _ ->
+                        Core.clearAllData(this@MainActivity)
+                        ai = emptyList(); aiSel.clear(); selectedAiRemoveIds.clear(); selectedMedIds.clear()
+                        aiText = ""; aiMsg = ""; query = ""; logQuery = ""; logFilter = "all"
+                        medSelectMode = false; aiRemoveMode = false
+                        editing = null; aiEditIdx = -1; showLog = false; showTemp = false
+                        toast("All PillPal data deleted")
+                        recreate()
+                    }.show()
+            }, lp(-2, -2, 0, 10, 0, 0))
         }
         addCard(p.gold, true) {
             addView(tx("About PillPal", 18f, p.ink, bold = true, serif = true))
